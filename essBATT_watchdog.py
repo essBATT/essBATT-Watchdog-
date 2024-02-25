@@ -77,8 +77,8 @@ class RepeatedTimer(object):
 
 
 
-##################### essBATT Controller Class ##############
-class essBATT_controller:  
+##################### essBATT Watchdog Class ##############
+class essBATT_watchdog:  
     def __init__(self, logger):
         self.logger = logger
         self.mqtt_client = None
@@ -1779,7 +1779,7 @@ class essBATT_controller:
 if __name__ == "__main__":
     ######## Logger Config ###############
     log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(funcName)s(%(lineno)d) %(message)s')
-    my_handler = RotatingFileHandler('essBATT_controller.log', mode='a', maxBytes=50*1024*1024, backupCount=1, encoding=None, delay=0)
+    my_handler = RotatingFileHandler('essBATT_watchdog.log', mode='a', maxBytes=50*1024*1024, backupCount=1, encoding=None, delay=0)
     my_handler.setFormatter(log_formatter)
     my_handler.setLevel(logging.DEBUG)
     app_log = logging.getLogger('root')
@@ -1787,14 +1787,14 @@ if __name__ == "__main__":
     app_log.addHandler(my_handler)
     
     ####### Create ESS Controller Object ###############################
-    ess_controller_obj = essBATT_controller(app_log)
+    ess_controller_obj = essBATT_watchdog(app_log)
 
     ######### Start the application ############################
     if(ess_controller_obj.ess_config_data_loaded_correctly is True):
         try:
             ess_controller_obj.run()
         finally:
-            ess_controller_obj.logger.warning("essBATT controller: Shutdown. Control loop exited and needs restart.")
+            ess_controller_obj.logger.warning("essBATT watchdog: Shutdown. Control loop exited and needs restart.")
             # Timer Objects have to be stopped
             ess_controller_obj.rt_keep_alive_obj.stop()
             ess_controller_obj.rt_ess_control_update_obj.stop()
@@ -1802,7 +1802,7 @@ if __name__ == "__main__":
             # MQTT Loop needs to be stopped
             ess_controller_obj.mqtt_client.loop_stop()
     else:
-        ess_controller_obj.logger.warning("essBATT controller not running and needs restart!")
+        ess_controller_obj.logger.warning("essBATT watchdog not running and needs restart!")
         # Timer Object has to be stopped
         ess_controller_obj.rt_keep_alive_obj.stop()
         ess_controller_obj.rt_ess_control_update_obj.stop()
