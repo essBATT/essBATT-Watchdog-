@@ -1,0 +1,12 @@
+version: '3.7'
+services:
+  essbatt_watchdog_service:
+    build: ./essBATT-Watchdog-
+    container_name: essbatt_watchdog_container
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./essBATT-Watchdog-:/code
+      - "/etc/timezone:/etc/timezone:ro"
+      - "/etc/localtime:/etc/localtime:ro"
+
