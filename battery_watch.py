@@ -3,10 +3,79 @@
 
 """Battery threshold monitoring for user notifications.
 
-Reads thresholds from ``watchdog_config.json`` → ``battery_watch`` and compares
-them to mapped local_values. Does not control the ESS; only raises alerts
-via the injected Notifier.
+Reads rules from ``watchdog_config.json`` → ``battery_watch``. Each rule is:
+
+  "cell_voltage_too_high": { "threshold": 3.6, "level": "critical" }
+
+``level`` is ``info`` | ``warning`` | ``critical`` and selects which
+notification channels fire (see Notifier). ``threshold: "none"`` disables
+a rule.
 """
+
+from notifier import severity_rank
+
+
+_VALID_LEVELS = frozenset({'info', 'warning', 'critical'})
+
+# (config_key, local_values key, compare op, human title, default level)
+_CHECK_SPECS = (
+    (
+        'cell_voltage_too_high',
+        'battery_max_cell_voltage',
+        'gt',
+        'Max cell voltage high',
+        'critical',
+    ),
+    (
+        'cell_voltage_too_low',
+        'battery_min_cell_voltage',
+        'lt',
+        'Min cell voltage low',
+        'critical',
+    ),
+    (
+        'pack_voltage_too_low',
+        'battery_voltage',
+        'lt',
+        'Pack voltage low',
+        'critical',
+    ),
+    (
+        'battery_too_hot',
+        'battery_temperature',
+        'gt',
+        'Battery temperature high',
+        'warning',
+    ),
+    (
+        'battery_too_cold',
+        'battery_temperature',
+        'lt',
+        'Battery temperature low',
+        'warning',
+    ),
+    (
+        'SOC_low',
+        'battery_soc',
+        'lt',
+        'Battery SOC low',
+        'warning',
+    ),
+    (
+        'SOC_high',
+        'battery_soc',
+        'gt',
+        'Battery SOC high',
+        'info',
+    ),
+    (
+        'current_too_high',
+        'battery_current_abs',
+        'gt',
+        'Battery current high',
+        'warning',
+    ),
+)
 
 
 def _is_numeric_threshold(value):
@@ -20,6 +89,22 @@ def _is_numeric_threshold(value):
         return False
 
 
+def _parse_rule(raw, default_level):
+    """Normalize a battery_watch entry to (threshold, level) or (None, level).
+
+    Accepts nested ``{threshold, level}`` only (greenfield config).
+    """
+    if not isinstance(raw, dict):
+        return None, default_level
+    threshold = raw.get('threshold')
+    level = str(raw.get('level', default_level) or default_level).strip().lower()
+    if level not in _VALID_LEVELS:
+        level = default_level
+    if not _is_numeric_threshold(threshold):
+        return None, level
+    return float(threshold), level
+
+
 class BatteryWatch:
     """Compares battery metrics against configured notification thresholds."""
 
@@ -31,87 +116,50 @@ class BatteryWatch:
 
     def update_config(self, config):
         self.config = config
-        self.thresholds = config.get('battery_watch', {})
+        self.rules = config.get('battery_watch', {}) or {}
 
     def evaluate(self, local_values):
         """Check thresholds; notify on rising edge of each alert condition.
 
         Returns:
-            list of currently active alert reason strings
+            list of currently active alert keys
         """
         if not local_values.get('all_CCGX_values_available', False):
             return list(self._active_alerts)
 
+        # Convenience: abs current for over-current check
+        current = local_values.get('battery_current')
+        if current is not None:
+            local_values['battery_current_abs'] = abs(current)
+
         active_now = set()
-        thr = self.thresholds
 
-        checks = [
-            (
-                'max_cell_high',
-                local_values.get('battery_max_cell_voltage'),
-                thr.get('voltage_too_high_notification'),
-                'gt',
-                'Max cell voltage high',
-            ),
-            (
-                'min_cell_low',
-                local_values.get('battery_min_cell_voltage'),
-                thr.get('voltage_too_low_notification'),
-                'lt',
-                'Min cell voltage low',
-            ),
-            (
-                'temp_high',
-                local_values.get('battery_temperature'),
-                thr.get('battery_too_hot_notification'),
-                'gt',
-                'Battery temperature high',
-            ),
-            (
-                'temp_low',
-                local_values.get('battery_temperature'),
-                thr.get('battery_too_cold_notification'),
-                'lt',
-                'Battery temperature low',
-            ),
-            (
-                'soc_low',
-                local_values.get('battery_soc'),
-                thr.get('SOC_low_notification'),
-                'lt',
-                'Battery SOC low',
-            ),
-            (
-                'soc_high',
-                local_values.get('battery_soc'),
-                thr.get('SOC_high_notification'),
-                'gt',
-                'Battery SOC high',
-            ),
-            (
-                'current_high',
-                abs(local_values.get('battery_current', 0) or 0),
-                thr.get('current_too_high_notification'),
-                'gt',
-                'Battery current high',
-            ),
-        ]
-
-        for key, value, threshold, op, title in checks:
-            if value is None or not _is_numeric_threshold(threshold):
+        for cfg_key, value_key, op, title, default_level in _CHECK_SPECS:
+            threshold, level = _parse_rule(
+                self.rules.get(cfg_key), default_level
+            )
+            if threshold is None:
                 continue
-            threshold = float(threshold)
+            value = local_values.get(value_key)
+            if value is None:
+                continue
             breached = (value > threshold) if op == 'gt' else (value < threshold)
             if not breached:
                 continue
-            active_now.add(key)
-            if key not in self._active_alerts:
+            active_now.add(cfg_key)
+            if cfg_key not in self._active_alerts:
                 body = (
                     title + ': value=' + str(value)
                     + ', threshold=' + str(threshold)
+                    + ', level=' + level
                 )
-                self.logger.warning(body)
-                self.notifier.notify_alert(title, body, severity='warning')
+                log_fn = (
+                    self.logger.error if severity_rank(level) >= severity_rank('critical')
+                    else self.logger.warning if severity_rank(level) >= severity_rank('warning')
+                    else self.logger.info
+                )
+                log_fn(body)
+                self.notifier.notify_alert(title, body, severity=level)
 
         recovered = self._active_alerts - active_now
         for key in recovered:

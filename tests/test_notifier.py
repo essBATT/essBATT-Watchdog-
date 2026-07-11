@@ -484,3 +484,35 @@ def test_notify_alert_critical_hits_pushover_and_telegram():
     n.notify_alert('fail', 'reason', severity='critical')
     assert any('api.telegram.org' in u for u in calls)
     assert any('pushover.net' in u for u in calls)
+
+
+def test_warning_does_not_use_pushover_even_if_enabled():
+    urlopen = MagicMock(
+        return_value=_FakeResponse(json.dumps({'ok': True, 'result': {}}))
+    )
+    n = Notifier(
+        _base_config(
+            telegram={
+                'enabled': 1,
+                'bot_token': '123:ABC',
+                'chat_id': '999',
+            },
+            pushover=_pushover_cfg(min_severity='warning'),
+        ),
+        MagicMock(),
+        urlopen_fn=urlopen,
+    )
+    n.notify_alert('warm', 't=36', severity='warning')
+    # telegram only — no pushover for warning policy
+    assert urlopen.called
+    for call in urlopen.call_args_list:
+        assert 'pushover.net' not in call.args[0].full_url
+
+
+def test_channels_for_severity_policy():
+    n = Notifier(_base_config(telegram={'enabled': 0}), MagicMock())
+    assert n.channels_for_severity('info') == frozenset({'mail', 'telegram'})
+    assert n.channels_for_severity('warning') == frozenset({'mail', 'telegram'})
+    assert n.channels_for_severity('critical') == frozenset(
+        {'mail', 'telegram', 'pushover'}
+    )

@@ -66,6 +66,15 @@ _SEVERITY_RANK = {
     'critical': 3,
 }
 
+# Which channels may fire for each severity (only if that channel is enabled).
+# info/warning → Mail + Telegram; critical → all configured channels incl. Pushover.
+_CHANNELS_BY_SEVERITY = {
+    'info': frozenset({'mail', 'telegram'}),
+    'warning': frozenset({'mail', 'telegram'}),
+    'error': frozenset({'mail', 'telegram'}),
+    'critical': frozenset({'mail', 'telegram', 'pushover'}),
+}
+
 
 def format_severity_label(severity):
     """Return e.g. '🚨 CRITICAL' for notification titles/bodies."""
@@ -146,8 +155,19 @@ class Notifier:
         self.mail_enabled = self.mail_cfg.get('enabled', 0) == 1
         self.pushover_enabled = self.pushover_cfg.get('enabled', 0) == 1
 
+    def channels_for_severity(self, severity):
+        """Return the set of channel names allowed for this severity."""
+        key = str(severity or 'error').strip().lower()
+        return _CHANNELS_BY_SEVERITY.get(
+            key, _CHANNELS_BY_SEVERITY['error']
+        )
+
     def notify_alert(self, title, body, severity='error'):
-        """Send an alert on all enabled channels.
+        """Send an alert on enabled channels allowed for this severity.
+
+        Channel policy (when the channel itself is enabled in config):
+          * info / warning / error → mail + telegram
+          * critical → mail + telegram + pushover
 
         Args:
             title: short subject / headline
@@ -158,11 +178,12 @@ class Notifier:
         text = label + ' ' + str(title) + ' — ' + str(body)
         self.logger.warning('NOTIFY: ' + text)
 
-        if self.mail_enabled:
+        channels = self.channels_for_severity(severity)
+        if self.mail_enabled and 'mail' in channels:
             self._send_mail(title, body, severity)
-        if self.telegram_enabled:
+        if self.telegram_enabled and 'telegram' in channels:
             self._send_telegram(title, body, severity)
-        if self.pushover_enabled:
+        if self.pushover_enabled and 'pushover' in channels:
             self._send_pushover(title, body, severity)
 
     def notify_recovery(self, title, body):
