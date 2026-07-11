@@ -1,0 +1,9 @@
+{
+    "settings_list_version": 1.0,
+    "AcPowerSetPoint": "CGwacs/AcPowerSetPoint",
+    "MaxDischargePower": "CGwacs/MaxDischargePower",
+    "MaxFeedInPower": "CGwacs/MaxFeedInPower",
+    "OvervoltageFeedIn": "CGwacs/OvervoltageFeedIn",
+    "PreventFeedback": "CGwacs/PreventFeedback",
+    "MaxChargeCurrent": "SystemSetup/MaxChargeCurrent"
+}

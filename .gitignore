@@ -1,1 +1,9 @@
 ess_controller.txt
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/

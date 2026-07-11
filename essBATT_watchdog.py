@@ -23,659 +23,395 @@
 
 # For more information, please refer to <http://unlicense.org/>
 
-import paho.mqtt.client as mqtt
+"""essBATT watchdog — composition root and monitor cycle.
+
+Read this file top-down:
+  1. ``essBATT_watchdog.__init__``  — wire modules together
+  2. ``run`` / ``stop``             — process lifetime
+  3. ``watchdog_cycle_update``      — one monitor tick
+
+Domain modules (failure detection, safe state, notifications) live outside
+this file. MQTT plumbing matches the controller's robust MqttBridge pattern.
+"""
+
 import logging
 from logging.handlers import RotatingFileHandler
+import signal
 import time
-import json
-import threading
-from datetime import datetime, timedelta
-import numbers
+
+import constants
+from utils import RepeatedTimer
+from config_manager import ConfigManager
+from ccgx_ingestion import CcgxIngestion
+from data_mapper import CcgxDataMapper
+from victron_output import VictronOutput
+from mqtt_bridge import MqttBridge
+from failure_monitor import FailureMonitor
+from safe_state import SafeStateManager
+from notifier import Notifier
+from battery_watch import BatteryWatch
 
 
-DEBUGGING_ON = False # Switch for debugging
+class essBATT_watchdog:
+    """Composition root + watchdog monitor cycle.
 
-###### Script internal parameters ########################################
-CERBO_KEEPALIVE_LENGTH = (30.0) # [s] Alle CERBO_KEEPALIVE_LENGTH Sekunden wird eine Keepalive Nachricht an den Cerbo gesendet
-MQTT_SERVER_TIMEOUT_TIMESPAN = 60 # [s] After this timeout timespan with no from the MQTT server some error handling will be triggered
-##########################################################################
+    Process lifetime follows ``self._running`` (signals / intentional stop),
+    not momentary MQTT connectivity — short broker interruptions are
+    tolerated while paho auto-reconnects and resubscribes.
+    """
 
-LOGLEVEL_NAME_TO_NUMBER = {'CRITICAL': 50, 'FATAL': 50, 'ERROR': 40, 'WARNING': 30, 'WARN': 30, 'INFO': 20, 'DEBUG': 10, 'NOTSET': 0}
-MULTIS_SWITCH_NUMBER_STRING_MAPPING = {'1':"CHARGER ON INVERTER OFF", '2':"INVERTER ON CHARGER OFF", '3':"INVERTER AND CHARGER ON", '4':"INVERTER AND CHARGER OFF"}
+    # ==================================================================
+    # Composition
+    # ==================================================================
 
-################### Timer Class ##############################
-# Class from MestreLion: https://stackoverflow.com/questions/474528/how-to-repeatedly-execute-a-function-every-x-seconds
-class RepeatedTimer(object):
-  def __init__(self, interval, function, *args, **kwargs):
-    self._timer = None
-    self.interval = interval
-    self.function = function
-    self.args = args
-    self.kwargs = kwargs
-    self.is_running = False
-    self.next_call = time.time()
-    self.start()
-
-  def _run(self):
-    self.is_running = False
-    self.start()
-    self.function(*self.args, **self.kwargs)
-
-  def start(self):
-    if not self.is_running:
-      self.next_call += self.interval
-      self._timer = threading.Timer(self.next_call - time.time(), self._run)
-      self._timer.start()
-      self.is_running = True
-
-  def stop(self):
-    self._timer.cancel()
-    self.is_running = False
-###############################################################
-
-
-
-##################### essBATT Watchdog Class ##############
-class essBATT_watchdog:  
     def __init__(self, logger):
         self.logger = logger
-        self.mqtt_client = None
-        self.mqtt_connection_ok = False
-        self.mqtt_disconnected = True
-        self.rt_keep_alive_obj = RepeatedTimer(CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo)
+        self._running = False
+        self._timers_started = False
+        self._last_disconnect_warn_at = None
+
         self.watchdog_config_data = {}
+        self.ess_setvalue_list = {}
         self.watchdog_config_data_loaded_correctly = False
-        self.CCGX_data = {'grid':{},'battery':{}, 'solarcharger':{}, 'settings':{}, 'system':{}}
-        self.read_config_json()
-        self.write_base_path = 'W/'+ self.watchdog_config_data['vrm_id'] + '/'
-        self.logger.setLevel(LOGLEVEL_NAME_TO_NUMBER[self.watchdog_config_data['debug_level']])
-        self.logger.info('Effective logger level: ' + str(self.logger.getEffectiveLevel()))
-        self.rt_essBATT_watchdog_update_obj = RepeatedTimer(self.watchdog_config_data['watchdog_update_rate'], self.watchdog_cycle_update)
-        self.rt_print_status_obj = RepeatedTimer(self.watchdog_config_data['script_alive_logging_interval'], self.print_alive_status_to_logger)
+        self.ess_setvalue_list_loaded_correctly = False
 
-###############################################################################################################################################################################################################################
-###############################################################################################################################################################################################################################
-###############################################################################################################################################################################################################################       
-    def run(self):        
-        # Configuration of the MQTT Client object
-        self.mqtt_client = mqtt.Client()
-        self.mqtt_client.username_pw_set(username=self.ess_config_data['mqtt_username'], password=self.ess_config_data['mqtt_password'])
-        self.mqtt_client.on_connect = self.on_connect
-        self.mqtt_client.on_subscribe = self.on_subscribe
-        self.mqtt_client.on_message = self.on_message
-        self.mqtt_client.on_disconnect = self.on_disconnect
-                
-        try:
-            self.mqtt_client.connect('localhost', port=self.ess_config_data['mqtt_server_COM_port'], keepalive=MQTT_SERVER_TIMEOUT_TIMESPAN, bind_address="")
-            self.logger.info("essBATT watchdog: Try to connect to MQTT Server: localhost on port " + str(self.ess_config_data['mqtt_server_COM_port']) + " with timeout of " + str(MQTT_SERVER_TIMEOUT_TIMESPAN) + "s")
-            self.mqtt_client.loop_start()
-            while not self.mqtt_connection_ok: #wait in loop until connected by on_connect callback function
-                self.logger.info("Waiting for MQTT server connection...")
-                time.sleep(1)
-            # Subscribe to all needed <service_types> of the Venus OS system and all their messages.
-            # Subscribtion to selected service_types is done to reduce the "on_message callback" load in case of ess_config "keepalive_get_all_topics":1
-            # Selection of messages is done in the send_keepalive_to_cerbo() function
-            base_path_str = "N/" + self.ess_config_data['vrm_id']
-            subscription_list_tmp = self.create_subscribtion_list(base_path_str)
-            (result, mid) = self.mqtt_client.subscribe(subscription_list_tmp)
-            self.logger.info("MQTT subscribtion function return value: " + str(result))
-            self.add_topic_specific_callbacks(base_path_str)
-            
-            ###### MAIN LOOP - essBATT watchdog loop while the MQTT connection is active ##########################
-            while self.mqtt_connection_ok is True:
-                # This is the loop for the watchdog cycle update functionality (watchdog_cycle_update()). It is empty because this function is
-                # called with the help of the "repeated timer" in a periodical manner (see _init_ function)
-                pass
-        except:
-            self.logger.error('Could not establish connection to MQTT Server. Critical error.')
-            self.mqtt_client.loop_stop()
-            self.mqtt_connection_ok = False
-                
-    def watchdog_cycle_update(self):
-        # Only update if MQTT connection is active 
-        if(self.mqtt_connection_ok is True):   
-            ############# Read data from Victron System ###################################
-            # This is done with the MQTT callback functions. The "up to date" data is stored in self.CCGX_data dictionary. Data fields in self.CCGX_data
-            # are created when the first message for a data field is received and it can be DELETED if the device that delivers this data is removed from the bus (e.g. solarcharger at night).
-            # Always make sure that the data field exists before using it!
-                    
-            # Reading most often needed values to local variables for convenience (while checking if they are available)
-            local_values = {}
-            self.read_values_to_local_dict(local_values)
-                    
-            ############# State machine ###################################################
-            # The statemachine handles all tasks associated with switching from "normal_operation" to "charge to SOC" or "balancing" and back.
-            try:
-                self.statemachine_update(local_values)
-            except Exception as e:
-                self.logger.exception('Unhandled Exception!')
-                raise
+        self.CCGX_data = {
+            'grid': {}, 'battery': {}, 'solarcharger': {},
+            'settings': {}, 'system': {},
+        }
 
+        self.config_manager = ConfigManager(self.logger, debug=constants.DEBUGGING_ON)
 
-        
-            
-###############################################################################################################################################################################################################################
-###############################################################################################################################################################################################################################
-###############################################################################################################################################################################################################################
-    
-    def get_scheduled_starttime_datetime_obj(self, mode_string):
-        format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
-        try:
-            ret_val = datetime.strptime(self.ess_controller_state[mode_string]['scheduled_start_time'], format_string)
-        except:
-            ret_val = None
-        return ret_val
-    
-            
-    def datetime_obj_from_input_timestamp(self, timestring, datestring):
-        # Dealing with the case, that no value is given
-        
-        if((timestring == "-") and (datestring == "-")):
-            self.logger.debug('Datetime object creator was called without a valid timestring. So nothing.')
+        self.watchdog_config_data = self.config_manager.load_config()
+        self.watchdog_config_data_loaded_correctly = (
+            self.config_manager.config_data_loaded_correctly
+        )
+        if not self.watchdog_config_data_loaded_correctly:
             return
-        # Default case for time is the beginning of the day
-        if(timestring == "-"):
-            timestring = "00:00"
-            self.logger.debug('Using default time 00:00 for datetime object because only date was given.')
-        # Default case for date is the date of today or (if this time is in the past then take the date of tomorrow)
-        if(datestring == "-"):
-            date_obj_now = datetime.now(tz=None)
-            datestring_today = date_obj_now.strftime(self.ess_config_data['external_control_settings']['date_format'])           
-            format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
-            temp_combined_datetime_str = datestring_today + ' '  + timestring
-            temp_test_obj = datetime.strptime(temp_combined_datetime_str, format_string)  
-            # Selection on the datestring based on the resulting timestamp being in the past or not
-            if(temp_test_obj < date_obj_now):
-                timedelta_obj = timedelta(days=1)
-                datestring = (datetime.now(tz=None) + timedelta_obj).strftime(self.ess_config_data['external_control_settings']['date_format'])
-                self.logger.debug('Only time was given. Assuming date of "TOMORROW" because time today already passed.')
-            else:
-                datestring = datestring_today
-                self.logger.debug('Only time was given. Assuming date of today to create datetime object.')
-        
-        combined_datetime_str = datestring + ' ' + timestring
-        format_string = self.ess_config_data['external_control_settings']['date_format'] + ' ' + self.ess_config_data['external_control_settings']['time_format']
+
+        self.ess_setvalue_list = self.config_manager.load_setvalue_list()
+        self.ess_setvalue_list_loaded_correctly = (
+            self.config_manager.setvalue_list_loaded_correctly
+        )
+        if not self.ess_setvalue_list_loaded_correctly:
+            return
+
+        self.write_base_path = (
+            'W/' + self.watchdog_config_data.get('vrm_id', 'unknown') + '/'
+        )
+
+        self.logger.setLevel(
+            constants.LOGLEVEL_NAME_TO_NUMBER[
+                self.watchdog_config_data.get('debug_level', 'INFO')
+            ]
+        )
+        self.logger.info(
+            'Effective logger level: ' + str(self.logger.getEffectiveLevel())
+        )
+
+        # Domain services
+        self.failure_monitor = FailureMonitor(self.watchdog_config_data, self.logger)
+        self.notifier = Notifier(self.watchdog_config_data, self.logger)
+        self.data_mapper = CcgxDataMapper(self.logger)
+        self.battery_watch = BatteryWatch(
+            self.watchdog_config_data, self.logger, self.notifier
+        )
+
+        self.ingestion = CcgxIngestion(
+            self.logger,
+            self.CCGX_data,
+            on_activity=self.failure_monitor.note_ccgx_message,
+        )
+        self.victron_output = VictronOutput(
+            self.logger,
+            mqtt_client=None,
+            ccgx_data=self.CCGX_data,
+            setvalue_list=self.ess_setvalue_list,
+            write_base_path=self.write_base_path,
+        )
+        self.safe_state = SafeStateManager(
+            self.watchdog_config_data, self.logger, self.victron_output
+        )
+
+        self.mqtt_bridge = MqttBridge(
+            self.logger,
+            self.watchdog_config_data,
+            self.ingestion,
+            on_connected=self._on_mqtt_connected,
+            on_controller_heartbeat=self.failure_monitor.note_controller_heartbeat,
+        )
+
+        # Started after first successful MQTT connect
+        self.rt_keep_alive_obj = None
+        self.rt_watchdog_update_obj = None
+        self.rt_print_status_obj = None
+
+    # ==================================================================
+    # MAIN LOGIC — process lifetime
+    # ==================================================================
+
+    def run(self):
+        """Connect MQTT, then keep the process alive until stop/signal."""
+        self._running = True
+        self._install_signal_handlers()
         try:
-            temp_obj = datetime.strptime(combined_datetime_str, format_string)
-            return temp_obj
-        except:
-            self.logger.error('Datetime Object could not be created. Input String: ' + combined_datetime_str)
-            return -1
-    
- 
-            
-    def create_subscribtion_list(self, base_path_str):
-        # Basic subscriptions
-        subscription_list = [(base_path_str + "/battery/#", 1),
-                             (base_path_str + "/grid/#", 1),
-                             (base_path_str + "/solarcharger/#", 1),
-                             (base_path_str + "/system/+/Ac/Consumption/#", 1),
-                             (base_path_str + "/settings/#", 1),
-                             (base_path_str + "/vebus/+/Mode", 1)]
-        # (optional) Subscriptions for external MQTT control    
-        if(self.ess_config_data['external_control_settings']['allow_external_control_over_mqtt'] == 1):
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['charge_battery_to_SOC'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['charge_battery_to_SOC'], 1))
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['activate_top_balancing_mode'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['activate_top_balancing_mode'], 1))
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_discharge'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_discharge'], 1))
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_charge'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['deactivate_charge'], 1))  
-            if(self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['reboot_ess_controller'] != "none"):
-                subscription_list.append((self.ess_config_data['external_control_settings']['mqtt_external_control_topics']['reboot_ess_controller'], 1))                
-        return subscription_list
-                                       
+            self.mqtt_bridge.start(
+                connect_timeout=constants.MQTT_INITIAL_CONNECT_TIMEOUT_S
+            )
 
-    def read_values_to_local_dict(self, local_values):
-        local_values['all_CCGX_values_available'] = True
-        if('grid_power_sum' in self.CCGX_data['grid']):
-            local_values['grid_power_sum'] = self.CCGX_data['grid']['grid_power_sum']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('soc' in self.CCGX_data['battery']):
-            local_values['battery_soc'] = self.CCGX_data['battery']['soc']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('max_cell_voltage' in self.CCGX_data['battery']):
-            local_values['battery_max_cell_voltage'] = self.CCGX_data['battery']['max_cell_voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('min_cell_voltage' in self.CCGX_data['battery']):
-            local_values['battery_min_cell_voltage'] = self.CCGX_data['battery']['min_cell_voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('current' in self.CCGX_data['battery']):
-            local_values['battery_current'] = self.CCGX_data['battery']['current']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('power' in self.CCGX_data['battery']):
-            local_values['battery_power'] = self.CCGX_data['battery']['power']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('voltage' in self.CCGX_data['battery']):
-            local_values['battery_voltage'] = self.CCGX_data['battery']['voltage']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L1_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l1_loads_power_consumtpion'] = self.CCGX_data['system']['L1_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L2_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l2_loads_power_consumtpion'] = self.CCGX_data['system']['L2_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-        if('L3_loads_power_consumption' in self.CCGX_data['system']):
-            local_values['l3_loads_power_consumtpion'] = self.CCGX_data['system']['L3_loads_power_consumption']
-        else:
-            local_values['all_CCGX_values_available'] = False
-                
-        local_values['solarcharger_power_sum'] = 0    
-        for element in self.CCGX_data['solarcharger']:
-            if('Power' in self.CCGX_data['solarcharger'][element]):
-                local_values['solarcharger_power_sum'] = local_values['solarcharger_power_sum'] + self.CCGX_data['solarcharger'][element]['Power']
-            else:
-                local_values['all_CCGX_values_available'] = False
-        local_values['solarcharger_current_sum'] = 0    
-        for element in self.CCGX_data['solarcharger']:
-            if('Current' in self.CCGX_data['solarcharger'][element]):
-                local_values['solarcharger_current_sum'] = local_values['solarcharger_current_sum'] + self.CCGX_data['solarcharger'][element]['Current']
-            else:
-                local_values['all_CCGX_values_available'] = False
-        
-        if(local_values['all_CCGX_values_available']):        
-            # Total loads power consumption
-            local_values['loads_total_power'] = local_values['l1_loads_power_consumtpion'] + local_values['l2_loads_power_consumtpion'] + local_values['l3_loads_power_consumtpion']
-            self.logger.debug('Loads total power: ' + str(local_values['loads_total_power']) + ', Loads L1 power: ' + str(local_values['l1_loads_power_consumtpion']) + ', Loads L2 power: ' + str(local_values['l2_loads_power_consumtpion']) + ', Loads L3 power: ' + str(local_values['l3_loads_power_consumtpion'])) 
-                        
-            # Estimation of the power losses from battery/solarcharger to AC loads. It might help the system to better respect the
-            # battery discharge/charge limits.
-            local_values['losses_dc2ac_est'] = (local_values['grid_power_sum'] - local_values['battery_power'] + local_values['solarcharger_power_sum']) - local_values['loads_total_power']
-            self.logger.debug('Estimated losses DC to AC: ' + str(local_values['losses_dc2ac_est']) + 'W')
-                    
-        self.logger.debug('Solarcharger power sum: ' + str(local_values['solarcharger_power_sum']) + ' Solarcharger current sum: ' + str(local_values['solarcharger_current_sum']))
-        if(not local_values['all_CCGX_values_available']):
-            self.logger.info('all_CCGX_values_available: "' + str(local_values['all_CCGX_values_available']) + '"')    # TODO: log level back to debug
-        
-           
-    def set_CCGX_value(self, set_val_name_str=None, set_val=0, only_set_if_deviation_to_current_setting=True):
-        """Function description: Sets the corresponding value in CCGX over MQTT.
-        Arguments:
-        set_val_name_str: [string] Victron name of the parameter found in ess_setvalue_list.json
-        set_val: [number] value to send to CCGX
-        only_set_if_deviation_to_current_setting: [True/False] If set to True it checks what the current setting in CCGX is and only if the new set value is different it sends the set command. False always sends the command.
-        return: 0: everything ok but no value send, 1: everything ok and value send, -1: error while sending"""
-        retval = 0
-        if(set_val_name_str is not None):
-            if(set_val_name_str in self.CCGX_data['settings']):
-                if(((only_set_if_deviation_to_current_setting is True) and (set_val != self.CCGX_data['settings'][set_val_name_str]))
-                or (only_set_if_deviation_to_current_setting is False)):
-                    try:
-                        topic_str = self.write_base_path + self.CCGX_data['settings_base_path'] + self.ess_setvalue_list[set_val_name_str]
-                        payload_str = json.dumps({"value": set_val})
-                        self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
-                        self.logger.debug(set_val_name_str + ': Published ' + payload_str + ' on ' + topic_str + '. self.CCGX_data["settings"]["' + set_val_name_str + '"]: ' + str(self.CCGX_data['settings'][set_val_name_str]))
-                        retval = 1
-                    except:
-                        self.logger.error(set_val_name_str + 'setpoint sending failed!')
-                        retval = -1
-        else: 
-            self.logger.error('No set value name given!')
-            retval = -1
-        return retval
-    
-    def set_multis_switch_mode(self, switch_position):
-        """
-        Possible values for "switch_position": 1=Charger Only; 2=Inverter Only; 3=On; 4=Off
-        See modbus tcp register list 3.10:
-        https://www.victronenergy.com/support-and-downloads/technical-information
-        com.victronenergy.vebus	Switch Position	33	uint16	1	0 to 65536	/Mode	yes	1	See Venus-OS manual for limitations, for example when VE.Bus BMS or DMC is installed.
-        """
-        if('vebus' in self.CCGX_data):
-            counter = 0
-            current_instance_id = ''
-            for key in self.CCGX_data['vebus']:
-                current_instance_id = str(key)
-                counter = counter + 1
-            # If the switch has a different position than the set value switch it to the new value
-            if(self.CCGX_data['vebus'][current_instance_id]['Mode'] != switch_position):
-                topic_str = self.write_base_path + 'vebus/' + current_instance_id + '/Mode'
-                payload_str = json.dumps({"value": switch_position})
-                self.mqtt_client.publish(topic=topic_str, payload=payload_str, qos=1, retain=0)
-                self.logger.info('"Multis SWITCH" switched to ' + MULTIS_SWITCH_NUMBER_STRING_MAPPING[str(switch_position)] + '(value: ' + str(switch_position) + ')')
-            if(counter > 1):
-                self.logger.error('It seems that there is more than one instance of "vebus" available. This was not considered during development of the script and needs to be investigated!!!')
+            ####### MAIN WATCHDOG LOOP #############
+            while self._running:
+                self._maybe_warn_long_disconnect()
+                time.sleep(1)
+            ########################################
 
+        except TimeoutError as e:
+            self.logger.error('MQTT connection failed (timeout): ' + str(e))
+            self._running = False
+        except OSError as e:
+            self.logger.error('MQTT connection failed (network/OS): ' + str(e))
+            self._running = False
+        except Exception:
+            self.logger.exception('Unexpected error during MQTT setup / main loop')
+            self._running = False
+
+    def stop(self):
+        """Stop background timers and MQTT (used on shutdown)."""
+        self._running = False
+        for timer_attr in (
+            'rt_keep_alive_obj',
+            'rt_watchdog_update_obj',
+            'rt_print_status_obj',
+        ):
+            timer = getattr(self, timer_attr, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    self.logger.exception('Error stopping timer ' + timer_attr)
+        if hasattr(self, 'mqtt_bridge') and self.mqtt_bridge is not None:
+            self.mqtt_bridge.stop()
+        self._timers_started = False
+
+    # ==================================================================
+    # MAIN LOGIC — watchdog cycle (called by timer while running)
+    # ==================================================================
+
+    def watchdog_cycle_update(self):
+        """One monitor tick: map inputs → failure checks → safe state / notify.
+
+        Skips work while MQTT is down. Domain exceptions are logged so the
+        timer thread keeps living.
+        """
+        if not self.mqtt_bridge.is_connected:
+            return
+
+        try:
+            local_values = {}
+            self.data_mapper.read_values_to_local_dict(self.CCGX_data, local_values)
+
+            # --- liveness of controller + CCGX ---
+            status = self.failure_monitor.evaluate()
+
+            if status['newly_failed']:
+                reason = '; '.join(status['newly_failed'])
+                self.safe_state.enter(reason=reason)
+                self.notifier.notify_alert(
+                    'essBATT Watchdog failure',
+                    reason,
+                    severity='critical',
+                )
+            elif status['any_failure'] and self.safe_state.active:
+                # Re-assert safe state periodically while failure persists
+                self.safe_state.enter(reason=self.safe_state.last_reason)
+            elif not status['any_failure'] and self.safe_state.active:
+                self.safe_state.clear(reason='all monitored sources healthy again')
+                self.notifier.notify_recovery(
+                    'essBATT Watchdog recovery',
+                    'Controller and CCGX timeouts cleared. Safe-state flag cleared '
+                    '(hardware not auto-restored).',
+                )
+
+            # --- optional Cerbo keepalive if controller is down ---
+            # (periodic keepalive timer handles the steady case; see below)
+
+            # --- battery threshold notifications ---
+            self.battery_watch.evaluate(local_values)
+
+        except Exception:
+            self.logger.exception(
+                'Unhandled exception in watchdog cycle — attempting safe state'
+            )
+            try:
+                self.safe_state.enter(reason='watchdog cycle exception')
+                self.notifier.notify_alert(
+                    'essBATT Watchdog internal error',
+                    'Unhandled exception in watchdog_cycle_update; safe state requested.',
+                    severity='critical',
+                )
+            except Exception:
+                self.logger.exception('Failed to enter safe state after cycle exception')
+
+    # ==================================================================
+    # INTERNALS — plumbing only (signals, timers, MQTT hooks)
+    # ==================================================================
+
+    def _install_signal_handlers(self):
+        def _handler(signum, frame):
+            try:
+                name = signal.Signals(signum).name
+            except Exception:
+                name = str(signum)
+            self.logger.warning(
+                'Received signal ' + name + ' — shutting down cleanly.'
+            )
+            self._running = False
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError) as e:
+                self.logger.debug(
+                    'Could not install handler for ' + str(sig) + ': ' + str(e)
+                )
+
+    def _start_timers(self):
+        if self._timers_started:
+            return
+        self.rt_keep_alive_obj = RepeatedTimer(
+            constants.CERBO_KEEPALIVE_LENGTH, self.send_keepalive_to_cerbo
+        )
+        self.rt_watchdog_update_obj = RepeatedTimer(
+            self.watchdog_config_data.get('watchdog_update_rate', 2.0),
+            self.watchdog_cycle_update,
+        )
+        self.rt_print_status_obj = RepeatedTimer(
+            self.watchdog_config_data.get('script_alive_logging_interval', 86400),
+            self.print_alive_status_to_logger,
+        )
+        self._timers_started = True
+        self.logger.info(
+            'Background timers started (watchdog cycle, keepalive, alive log).'
+        )
+
+    def _on_mqtt_connected(self, is_reconnect=False):
+        """After every successful CONNACK + subscribe: client, keepalive, timers."""
+        if self.mqtt_bridge.client is not None:
+            self.victron_output.set_mqtt_client(self.mqtt_bridge.client)
+        self.send_keepalive_to_cerbo()
+        if not self._timers_started:
+            self._start_timers()
+        if is_reconnect:
+            self.logger.info(
+                'MQTT session restored: resubscribed, keepalive sent, monitoring continues.'
+            )
+
+    def _maybe_warn_long_disconnect(self):
+        if self.mqtt_bridge.is_connected:
+            self._last_disconnect_warn_at = None
+            return
+        duration = self.mqtt_bridge.disconnect_duration_s()
+        if duration < constants.MQTT_DISCONNECT_WARN_AFTER_S:
+            return
+        now = time.time()
+        if (
+            self._last_disconnect_warn_at is not None
+            and (now - self._last_disconnect_warn_at)
+            < constants.MQTT_DISCONNECT_WARN_INTERVAL_S
+        ):
+            return
+        self._last_disconnect_warn_at = now
+        self.logger.warning(
+            'MQTT still disconnected for '
+            + str(int(duration))
+            + 's — watchdog cycle paused; waiting for paho auto-reconnect.'
+        )
 
     def send_keepalive_to_cerbo(self):
-        # Documentation needed to know which values to send how is here:
-        # https://github.com/victronenergy/dbus-mqtt
-        # https://www.victronenergy.com/live/ess:ess_mode_2_and_3
-        try:
-            # Sends keepalive to Victron OS in a way, that all available topics are returned (good for debugging but high network and system load)
-            if(self.watchdog_config_data['keepalive_get_all_topics'] == 1):
-                payload_string = ""
-                topic_string = "R/" + self.ess_config_data['vrm_id'] + "/system/0/Serial"
-                # Publish Topic
-                errcode = self.mqtt_client.publish(topic_string, payload=payload_string, qos=0, retain=False)
-                # Logging
-                log_string = "Keepalive (all topics) message send! Errorcode: " + str(errcode) + ". Published topic: \'" + topic_string
-                self.logger.debug(log_string)
-        except:
-            # Logging
-            log_string = "FAILED to publish Keep Alive message to Cerbo!"
-            self.logger.warning(log_string)
-            
-    def print_alive_status_to_logger(self):
-        self.logger.info('essBATT watchdog is up and running!')
-    
-    def read_config_json(self):
-        try:
-            if(DEBUGGING_ON):
-                f = open('./smarthome_projects/essBATT-Controller-/ess_config.json') # Path for debug mode
-            else:
-                f = open('ess_config.json') # Path for productive mode
-        except:
-            self.logger.error("ess_config.json file could not be opened!")
-            return
-        # returns JSON object as a dictionary
-        try:           
-            self.ess_config_data = json.load(f)
-        except:
-            self.logger.error("ess_config.json was opened but could not be loaded. Check for json file syntax errors!")
-            f.close()
-            return
-        self.ess_config_data_loaded_correctly = True
-        self.logger.debug('ess_config.json file loaded.')
-        f.close()
-    
-    def add_topic_specific_callbacks(self, base_path_str):
-        # Grid
-        topic_str = base_path_str + "/grid/+/Ac/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_grid_power)
-        topic_str = base_path_str + "/grid/+/Ac/L1/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L1_power)
-        topic_str = base_path_str + "/grid/+/Ac/L1/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L1_current)
-        topic_str = base_path_str + "/grid/+/Ac/L2/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L2_power)
-        topic_str = base_path_str + "/grid/+/Ac/L2/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L2_current)
-        topic_str = base_path_str + "/grid/+/Ac/L3/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L3_power)
-        topic_str = base_path_str + "/grid/+/Ac/L3/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_L3_current)
-        # Battery
-        topic_str = base_path_str + "/battery/+/Soc"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_soc)
-        topic_str = base_path_str + "/battery/+/System/MaxCellVoltage"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_maxcellvoltage)
-        topic_str = base_path_str + "/battery/+/System/MinCellVoltage"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_mincellvoltage)
-        topic_str = base_path_str + "/battery/+/Dc/0/Temperature"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_temp)
-        topic_str = base_path_str + "/battery/+/Dc/0/Current"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_current)
-        topic_str = base_path_str + "/battery/+/Dc/0/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_power)
-        topic_str = base_path_str + "/battery/+/Dc/0/Voltage"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_battery_voltage)
-        # Solarcharger
-        topic_str = base_path_str + "/solarcharger/+/Yield/Power"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_solarcharger_power)
-        topic_str = base_path_str + "/solarcharger/+/Dc/0/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_solarcharger_dc_values)
-        # System
-        topic_str = base_path_str + "/system/+/Ac/Consumption/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_system_AC_consumption)
-        # Misc
-        topic_str = base_path_str + "/settings/+/Settings/CGwacs/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_settings_Cgwacs)
-        topic_str = base_path_str + "/settings/+/Settings/SystemSetup/#"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_settings_SystemSetup)
-        topic_str = base_path_str + "/vebus/+/Mode"
-        self.mqtt_client.message_callback_add(topic_str, self.on_msg_multis_switch_mode)
-        
-    def device_removed_from_bus_detected(self, topic):
-        split_topic = topic.split('/')
-        device_type = split_topic[2]
-        device_instance = split_topic[3]
-        try:
-            # If the device is a solarcharger the internal structure has an entry for each solarcharger.
-            if(device_type != 'solarcharger'):
-                self.CCGX_data[device_type] = {}
-            else:
-                self.CCGX_data[device_type][device_instance] = {}
-            self.logger.info('Received json string without "value". Probably device removed from bus. Topic: ' + topic)
-        except:
-            self.logger.error('Deleting device instance due to empty payload failed for unknown reason.') 
-        
-                         
-    ##################### MQTT Callback Functions ##############
-    # The callback when this client recieves A CONNACK from the broker    
-    def on_connect(self, client, userdata, flags, rc):
-        if rc==0:
-            self.logger.info("Success: Connected to MQTT Server with result code "+str(rc))
-            self.mqtt_connection_ok = True
-            self.mqtt_disconnected = False
-        else:
-            self.logger.error("Failed to connected to MQTT Server with result code "+str(rc))
-            self.mqtt_connection_ok = False
-        
-    # The callback when the MQTT broker disconnects
-    def on_disconnect(self, client, userdata, rc):
-        self.logger.warning("MQTT server disconnected. Reason: "  + str(rc))
-        self.mqtt_connection_ok = False
-        self.mqtt_disconnected  = True
-            
-    # The callback for when a PUBLISH message is received from the server.
-    def on_message(self, client, userdata, msg):
-        self.logger.debug("New unused (!!!) MQTT message: " + msg.topic +" "+ str(msg.payload))
-        #self.store_received_mqtt_message(msg.topic, msg.payload)
-        
-    def on_subscribe(self, client, userdata, mid, granted_qos):  # subscribe to mqtt broker
-        self.logger.debug("MQTT on_subscribe function called!")
-    ######### Topic specific callbacks ############################
-    # Grid
-    def on_msg_grid_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['grid_power_sum'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L1_power(self, client, userdata, msg):
-        try:
-            
-            self.CCGX_data['grid']['L1_power'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L1_current(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L1_current'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L2_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L2_power'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L2_current(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L2_current'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L3_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['grid']['L3_power'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_L3_current(self, client, userdata, msg):
-        try:    
-            self.CCGX_data['grid']['L3_current'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    # Battery
-    def on_msg_battery_soc(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['soc'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_maxcellvoltage(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['max_cell_voltage'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_mincellvoltage(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['min_cell_voltage'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_temp(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['temperature'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_current(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['current'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_power(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['power'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-            
-    def on_msg_battery_voltage(self, client, userdata, msg):
-        try:
-            self.CCGX_data['battery']['voltage'] = json.loads(msg.payload)['value']
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-    # Solarcharger
-    # With "grid" and "battery" callbacks the callback functions only handle one value. With the solarchargers the message handling is 
-    # done a bit different, because the chargers are added and removed dynamically and you could also permantly add/remove a solarcharger and 
-    # this script should still work. That´s why these solarcharger callback functions are more complex and involve "topic parsing" and handle multiple values. 
-    # As long as a solarcharger is active on the bus values are stored. If it vanishes from the bus the whole data structure for this solarcharger
-    # is deleted.
-    def on_msg_solarcharger_power(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            payload_value = json.loads(msg.payload)['value']
-            solar_charger_topic_id_str = split_topic[3]
-            # If this solarcharger is not known add it to the dictionary
-            if(solar_charger_topic_id_str not in self.CCGX_data['solarcharger']):
-                self.CCGX_data['solarcharger'][solar_charger_topic_id_str] = {}
-            # Store the power value
-            self.CCGX_data['solarcharger'][solar_charger_topic_id_str]['Power'] = payload_value
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-       
-    def on_msg_solarcharger_dc_values(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        try:
-            payload_value = json.loads(msg.payload)['value']
-            solar_charger_topic_id_str = split_topic[3]
-            value_name_str = split_topic[6]
-            # If this solarcharger is not known add it to the dictionary
-            if(solar_charger_topic_id_str not in self.CCGX_data['solarcharger']):
-                self.CCGX_data['solarcharger'][solar_charger_topic_id_str] = {}
-            # Store the value in the corresponding data field
-            self.CCGX_data['solarcharger'][solar_charger_topic_id_str][value_name_str] = payload_value
-        except:
-            self.device_removed_from_bus_detected(msg.topic)
-    
-    # System
-    def on_msg_system_AC_consumption(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        phase_number = split_topic[6]
-        if(phase_number != 'NumberOfPhases'):
-            measurement_name = split_topic[7]
-            value_name = phase_number + '_loads_power_consumption'
-            try:
-                if(measurement_name == 'Power'):
-                    payload_value = json.loads(msg.payload)['value']
-                    self.CCGX_data['system'][value_name] = payload_value
-            except:
-                self.logger.error('Unexpected payload received. Should not happen.')
-            
-    # Misc
-    def on_msg_settings_Cgwacs(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        value_name = split_topic[6]
-        try:
-            payload_value = json.loads(msg.payload)['value']
-            self.CCGX_data['settings'][value_name] = payload_value
-            # Store required path to the settings for write requests
-            if('settings_base_path' not in self.CCGX_data):
-                self.CCGX_data['settings_base_path'] = 'settings/' + split_topic[3] + '/Settings/'
-        except:
-            self.logger.error('Unexpected payload received. Should not happen with settings.')
-        
-    def on_msg_settings_SystemSetup(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        value_name = split_topic[6]
-        try:
-            payload_value = json.loads(msg.payload)['value']
-            self.CCGX_data['settings'][value_name] = payload_value
-        except:
-            self.logger.error('Unexpected payload received. Should not happen with settings.')
-            
-    def on_msg_multis_switch_mode(self, client, userdata, msg):
-        split_topic = msg.topic.split('/')
-        instance_id = split_topic[3]
-        value_name = split_topic[4]
-        try:
-            if('vebus' not in self.CCGX_data):
-                self.CCGX_data['vebus'] = {}
-            if(instance_id not in self.CCGX_data['vebus']):
-                self.CCGX_data['vebus'][instance_id] = {}
-            payload_value = json.loads(msg.payload)['value']
-            self.CCGX_data['vebus'][instance_id][value_name] = payload_value
-        except:
-            self.logger.error('Unexpected payload received. Should not happen with vebus.')
-            
-################################################################################################################################################################################
+        """Timer entry: Cerbo keepalive while connected.
 
-  
-if __name__ == "__main__":
-    ######## Logger Config ###############
-    log_formatter = logging.Formatter('%(asctime)s %(levelname)s %(funcName)s(%(lineno)d) %(message)s')
-    my_handler = RotatingFileHandler('essBATT_watchdog.log', mode='a', maxBytes=50*1024*1024, backupCount=1, encoding=None, delay=0)
+        If ``send_keep_alive_if_essBATT_controller_is_down`` is 1, keepalive
+        is only sent when the controller is considered failed (or when
+        controller heartbeat monitoring is disabled — always send so CCGX
+        data keeps flowing for the watchdog itself).
+        """
+        if not self.mqtt_bridge.is_connected:
+            return
+
+        only_when_controller_down = (
+            self.watchdog_config_data.get(
+                'send_keep_alive_if_essBATT_controller_is_down', 1
+            )
+            == 1
+        )
+        heartbeat_configured = (
+            self.watchdog_config_data.get('controller_heartbeat_topic', 'none')
+            not in (None, 'none', '')
+        )
+
+        if only_when_controller_down and heartbeat_configured:
+            if not self.failure_monitor.controller_failed:
+                # Controller is alive; it should own Cerbo keepalive.
+                return
+
+        self.victron_output.send_keepalive(
+            self.watchdog_config_data.get('vrm_id'),
+            self.watchdog_config_data.get('keepalive_get_all_topics', 0),
+        )
+
+    def print_alive_status_to_logger(self):
+        connected = 'connected' if self.mqtt_bridge.is_connected else 'DISCONNECTED'
+        safe = 'ACTIVE' if self.safe_state.active else 'inactive'
+        self.logger.info(
+            'essBATT watchdog is up and running! MQTT: '
+            + connected
+            + ', safe_state: '
+            + safe
+            + ', controller_failed: '
+            + str(self.failure_monitor.controller_failed)
+            + ', ccgx_failed: '
+            + str(self.failure_monitor.ccgx_failed)
+        )
+
+
+# ======================================================================
+# Entry point
+# ======================================================================
+
+if __name__ == '__main__':
+    log_formatter = logging.Formatter(
+        '%(asctime)s %(levelname)s %(funcName)s(%(lineno)d) %(message)s'
+    )
+    my_handler = RotatingFileHandler(
+        'essBATT_watchdog.log',
+        mode='a',
+        maxBytes=50 * 1024 * 1024,
+        backupCount=1,
+        encoding=None,
+        delay=0,
+    )
     my_handler.setFormatter(log_formatter)
     my_handler.setLevel(logging.DEBUG)
     app_log = logging.getLogger('root')
-    app_log.setLevel(logging.INFO) # Default is "info" but this setting is later overwritten by ess_config.json setting
+    app_log.setLevel(logging.INFO)
     app_log.addHandler(my_handler)
-    
-    ####### Create essBATT watchdog object ###############################
-    essBATT_watchdog_obj = essBATT_watchdog(app_log)
 
-    ######### Start the application ############################
-    if(essBATT_watchdog_obj.ess_config_data_loaded_correctly is True):
+    watchdog_obj = essBATT_watchdog(app_log)
+
+    if (
+        watchdog_obj.watchdog_config_data_loaded_correctly is True
+        and watchdog_obj.ess_setvalue_list_loaded_correctly is True
+    ):
         try:
-            essBATT_watchdog_obj.run()
+            watchdog_obj.run()
         finally:
-            essBATT_watchdog_obj.logger.warning("essBATT watchdog: Shutdown. Main loop exited and needs restart.")
-            # Timer Objects have to be stopped
-            essBATT_watchdog_obj.rt_keep_alive_obj.stop()
-            essBATT_watchdog_obj.rt_essBATT_watchdog_update_obj.stop()
-            essBATT_watchdog_obj.rt_print_status_obj.stop()
-            # MQTT Loop needs to be stopped
-            essBATT_watchdog_obj.mqtt_client.loop_stop()
+            watchdog_obj.logger.warning(
+                'essBATT watchdog: Shutdown. Stopping timers and MQTT.'
+            )
+            watchdog_obj.stop()
     else:
-        essBATT_watchdog_obj.logger.warning("essBATT watchdog not running and needs restart!")
-        # Timer Object has to be stopped
-        essBATT_watchdog_obj.rt_keep_alive_obj.stop()
-        essBATT_watchdog_obj.rt_essBATT_watchdog_update_obj.stop()
-        essBATT_watchdog_obj.rt_print_status_obj.stop()
+        watchdog_obj.logger.warning(
+            'essBATT watchdog not running and needs restart!'
+        )
+        if hasattr(watchdog_obj, 'stop'):
+            watchdog_obj.stop()

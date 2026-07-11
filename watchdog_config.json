@@ -1,19 +1,42 @@
 {
-    "config_version": 1.0,
+    "config_version": 2.0,
     "vrm_id": "YOUR VRM ID",
     "debug_level": "INFO",
     "mqtt_username": "YOUR MQTT SERVER USERNAME",
     "mqtt_password": "YOUR MQTT SERVER PASSWORD",
     "mqtt_server_COM_port": 1883,
     "script_alive_logging_interval": 86400,
-    "watchdog_update_rate": 2,
+    "watchdog_update_rate": 2.0,
+    "keepalive_get_all_topics": 0,
+
+    "controller_heartbeat_topic": "none",
     "essBATT_controller_timeout_detection_duration": 95,
+    "victron_CCGX_timeout_detection_duration": 60,
     "victron_CCGX_timout_detection_duration": 60,
+
     "send_keep_alive_if_essBATT_controller_is_down": 1,
     "switch_off_multis_if_failure_is_detected": 1,
     "ac_power_set_point_if_failure_is_detected": 5,
-    "notification_mail_address":"your.mailaddress@abc.com",
-    "battery_watch":{
+    "zero_charge_discharge_limits_if_failure_is_detected": 1,
+
+    "notification_mail_address": "your.mailaddress@abc.com",
+    "notifications": {
+        "mail": {
+            "enabled": 0,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "smtp_user": "",
+            "smtp_password": "",
+            "from_address": "essbatt-watchdog@example.com"
+        },
+        "telegram": {
+            "enabled": 0,
+            "bot_token": "",
+            "chat_id": ""
+        }
+    },
+
+    "battery_watch": {
         "voltage_too_high_notification": 3.6,
         "voltage_too_low_notification": 2.9,
         "battery_too_hot_notification": 35,
