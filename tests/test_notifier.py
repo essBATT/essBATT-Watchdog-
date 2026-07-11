@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 import smtplib
 
-from notifier import Notifier
+from notifier import Notifier, format_severity_label
 
 
 class _FakeResponse:
@@ -135,10 +135,27 @@ def test_telegram_send_success():
     assert request.get_method() == 'POST'
     payload = json.loads(request.data.decode('utf-8'))
     assert payload['chat_id'] == '999001'
-    assert '[WARNING] Cell high' in payload['text']
+    assert payload['text'].startswith('⚠️ WARNING Cell high')
     assert 'max=3.7' in payload['text']
     assert payload['disable_web_page_preview'] is True
     assert any('Telegram alert sent' in str(c.args[0]) for c in logger.info.call_args_list)
+
+
+def test_critical_telegram_message_uses_alert_emoji():
+    urlopen = MagicMock(
+        return_value=_FakeResponse(json.dumps({'ok': True, 'result': {}}))
+    )
+    n = Notifier(_base_config(), MagicMock(), urlopen_fn=urlopen)
+    n.notify_alert('Controller down', 'timeout 95s', severity='critical')
+    payload = json.loads(urlopen.call_args.args[0].data.decode('utf-8'))
+    assert payload['text'].startswith('🚨 CRITICAL Controller down')
+    assert 'timeout 95s' in payload['text']
+
+
+def test_format_severity_label():
+    assert format_severity_label('critical') == '🚨 CRITICAL'
+    assert format_severity_label('WARNING') == '⚠️ WARNING'
+    assert format_severity_label('info') == 'ℹ️ INFO'
 
 
 def test_telegram_api_not_ok():
@@ -183,7 +200,7 @@ def test_notify_recovery_uses_info_severity():
     n = Notifier(_base_config(), MagicMock(), urlopen_fn=urlopen)
     n.notify_recovery('back', 'ok again')
     payload = json.loads(urlopen.call_args.args[0].data.decode('utf-8'))
-    assert payload['text'].startswith('[INFO]')
+    assert payload['text'].startswith('ℹ️ INFO')
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +261,7 @@ def test_mail_send_success_starttls_and_login():
     assert isinstance(msg, EmailMessage)
     assert msg['To'] == 'user@example.com'
     assert msg['From'] == 'watchdog@example.com'
-    assert '[WARNING]' in msg['Subject']
+    assert '⚠️ WARNING' in msg['Subject']
     assert 'Cell high' in msg['Subject']
     assert 'max=3.7' in msg.get_content()
     assert smtp.quit_called is True

@@ -40,6 +40,21 @@ _MAIL_PLACEHOLDERS = frozenset({
     'YOUR_SMTP_PASSWORD',
 })
 
+# Visual severity markers (especially useful in Telegram notification previews)
+_SEVERITY_EMOJI = {
+    'critical': '🚨',
+    'error': '❌',
+    'warning': '⚠️',
+    'info': 'ℹ️',
+}
+
+
+def format_severity_label(severity):
+    """Return e.g. '🚨 CRITICAL' for notification titles/bodies."""
+    key = str(severity or 'error').strip().lower()
+    emoji = _SEVERITY_EMOJI.get(key, '▪️')
+    return emoji + ' ' + key.upper()
+
 
 class Notifier:
     """Dispatches alerts to configured notification backends."""
@@ -105,7 +120,8 @@ class Notifier:
             body: longer description
             severity: 'info' | 'warning' | 'error' | 'critical'
         """
-        text = '[' + severity.upper() + '] ' + title + ' — ' + body
+        label = format_severity_label(severity)
+        text = label + ' ' + str(title) + ' — ' + str(body)
         self.logger.warning('NOTIFY: ' + text)
 
         if self.mail_enabled:
@@ -176,9 +192,10 @@ class Notifier:
             )
             return False
 
-        subject = '[essBATT][' + str(severity).upper() + '] ' + str(title)
+        label = format_severity_label(severity)
+        subject = '[essBATT] ' + label + ' ' + str(title)
         text_body = (
-            'Severity: ' + str(severity).upper() + '\n'
+            'Severity: ' + label + '\n'
             + 'Title: ' + str(title) + '\n\n'
             + str(body) + '\n'
         )
@@ -267,9 +284,9 @@ class Notifier:
             )
             return False
 
-        text = (
-            '[' + str(severity).upper() + '] ' + str(title) + '\n' + str(body)
-        )
+        label = format_severity_label(severity)
+        # Emoji first so it shows in the notification preview line
+        text = label + ' ' + str(title) + '\n' + str(body)
         # Telegram limit ~4096 characters
         if len(text) > 4000:
             text = text[:3997] + '...'
