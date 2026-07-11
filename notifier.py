@@ -60,7 +60,6 @@ class Notifier:
 
     def update_config(self, config):
         self.config = config
-        self.mail_address = config.get('notification_mail_address')
         notifications = config.get('notifications', {})
         self.telegram_cfg = dict(notifications.get('telegram', {}) or {})
         self.mail_cfg = dict(notifications.get('mail', {}) or {})
@@ -96,14 +95,7 @@ class Notifier:
                     self.mail_cfg[cfg_key] = val
 
         self.telegram_enabled = self.telegram_cfg.get('enabled', 0) == 1
-        if 'enabled' in self.mail_cfg:
-            self.mail_enabled = self.mail_cfg.get('enabled') == 1
-        else:
-            # Legacy: enable mail if a real top-level address is set
-            self.mail_enabled = bool(
-                self.mail_address
-                and self.mail_address not in _MAIL_PLACEHOLDERS
-            )
+        self.mail_enabled = self.mail_cfg.get('enabled', 0) == 1
 
     def notify_alert(self, title, body, severity='error'):
         """Send an alert on all enabled channels.
@@ -128,25 +120,15 @@ class Notifier:
     # ------------------------------------------------------------------
     # Mail (SMTP)
     # ------------------------------------------------------------------
-    def _mail_to_address(self):
-        """Recipient: mail.to_address, else legacy notification_mail_address."""
-        to_addr = str(self.mail_cfg.get('to_address') or '').strip()
-        if to_addr and to_addr not in _MAIL_PLACEHOLDERS:
-            return to_addr
-        legacy = str(self.mail_address or '').strip()
-        if legacy and legacy not in _MAIL_PLACEHOLDERS:
-            return legacy
-        return None
-
     def _mail_settings(self):
         """Return dict of SMTP settings or None if incomplete."""
-        to_addr = self._mail_to_address()
+        to_addr = str(self.mail_cfg.get('to_address') or '').strip()
         host = str(self.mail_cfg.get('smtp_host') or '').strip()
         from_addr = str(self.mail_cfg.get('from_address') or '').strip()
         user = str(self.mail_cfg.get('smtp_user') or '').strip()
         password = str(self.mail_cfg.get('smtp_password') or '')
 
-        if to_addr is None:
+        if not to_addr or to_addr in _MAIL_PLACEHOLDERS:
             return None
         if not host or host in _MAIL_PLACEHOLDERS:
             return None
@@ -188,8 +170,8 @@ class Notifier:
         settings = self._mail_settings()
         if settings is None:
             self.logger.error(
-                'Mail enabled but incomplete SMTP config. Need to_address '
-                '(or notification_mail_address), smtp_host, from_address. '
+                'Mail enabled but incomplete SMTP config. Need '
+                'notifications.mail.to_address, smtp_host, from_address. '
                 'Prefer watchdog_config.local.json or ESSBATT_MAIL_* env vars.'
             )
             return False

@@ -63,7 +63,6 @@ class _FakeSMTP:
 
 def _base_config(telegram=None, mail=None):
     return {
-        'notification_mail_address': 'your.mailaddress@abc.com',
         'notifications': {
             'mail': mail if mail is not None else {'enabled': 0},
             'telegram': telegram if telegram is not None else {
@@ -250,22 +249,6 @@ def test_mail_send_success_starttls_and_login():
     assert 'max=3.7' in msg.get_content()
     assert smtp.quit_called is True
     assert any('Mail alert sent' in str(c.args[0]) for c in logger.info.call_args_list)
-
-
-def test_mail_uses_legacy_notification_mail_address():
-    _FakeSMTP.instances.clear()
-
-    def factory(host, port, timeout_s, use_ssl):
-        return _FakeSMTP(host, port, timeout=timeout_s)
-
-    cfg = _base_config(
-        telegram={'enabled': 0},
-        mail=_mail_cfg(to_address=''),  # empty → fall back
-    )
-    cfg['notification_mail_address'] = 'legacy@example.com'
-    n = Notifier(cfg, MagicMock(), smtp_factory=factory)
-    assert n._send_mail('t', 'b', 'info') is True
-    assert _FakeSMTP.instances[0].sent[0]['To'] == 'legacy@example.com'
 
 
 def test_mail_env_overrides(monkeypatch):

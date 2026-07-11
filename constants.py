@@ -10,8 +10,6 @@ CERBO_KEEPALIVE_LENGTH = 30.0
 
 # MQTT protocol keepalive to the local broker (paho connect keepalive=)
 MQTT_BROKER_PROTOCOL_KEEPALIVE_S = 60
-# Legacy alias
-MQTT_SERVER_TIMEOUT_TIMESPAN = MQTT_BROKER_PROTOCOL_KEEPALIVE_S
 
 # How long to wait for the first successful CONNACK before giving up
 MQTT_INITIAL_CONNECT_TIMEOUT_S = 60.0

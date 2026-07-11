@@ -33,12 +33,8 @@ class FailureMonitor:
         self.controller_timeout_s = float(
             config.get('essBATT_controller_timeout_detection_duration', 95)
         )
-        # typo kept as alias for the historical config key
         self.ccgx_timeout_s = float(
-            config.get(
-                'victron_CCGX_timeout_detection_duration',
-                config.get('victron_CCGX_timout_detection_duration', 60),
-            )
+            config.get('victron_CCGX_timeout_detection_duration', 60)
         )
         self.heartbeat_topic = config.get('controller_heartbeat_topic', 'none')
 
