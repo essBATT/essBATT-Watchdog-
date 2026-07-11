@@ -12,8 +12,7 @@ omit =
 
 [report]
 # Fail CI if overall application coverage drops below this.
-# Raise toward the controller's 75% as more modules get unit tests.
-fail_under = 25
+fail_under = 75
 precision = 1
 show_missing = True
 skip_empty = True

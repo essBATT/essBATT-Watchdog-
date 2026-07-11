@@ -1,6 +1,8 @@
-"""Tests for safe-state policy (timeouts + critical battery)."""
+"""Tests for safe-state policy and SafeStateManager actions."""
 
-from safe_state import resolve_safe_state_action
+from unittest.mock import MagicMock
+
+from safe_state import SafeStateManager, resolve_safe_state_action
 
 
 def _failure(newly=None, any_failure=False):
@@ -108,3 +110,67 @@ def test_combined_new_failure_and_battery_critical():
     assert 'ccgx_timeout' in d['reason']
     assert 'battery_critical' in d['reason']
     assert d['notify_failure'] is True
+
+
+def _manager(config=None, victron=None):
+    cfg = {
+        'switch_off_multis_if_failure_is_detected': 1,
+        'ac_power_set_point_if_failure_is_detected': 5,
+        'zero_charge_discharge_limits_if_failure_is_detected': 1,
+    }
+    if config:
+        cfg.update(config)
+    vo = victron or MagicMock()
+    vo.set_ccgx_value.return_value = 1
+    vo.set_multis_switch_mode.return_value = True
+    return SafeStateManager(cfg, MagicMock(), vo), vo
+
+
+def test_enter_applies_setpoints_zero_limits_and_multis_off():
+    mgr, vo = _manager()
+    attempted = mgr.enter(reason='controller_timeout')
+    assert attempted is True
+    assert mgr.active is True
+    assert mgr.last_reason == 'controller_timeout'
+
+    names = [
+        c.kwargs['set_val_name_str'] for c in vo.set_ccgx_value.call_args_list
+    ]
+    assert 'AcPowerSetPoint' in names
+    assert 'MaxChargeCurrent' in names
+    assert 'MaxDischargePower' in names
+    vo.set_multis_switch_mode.assert_called_once_with(4)
+
+
+def test_enter_skips_disabled_actions():
+    mgr, vo = _manager({
+        'switch_off_multis_if_failure_is_detected': 0,
+        'ac_power_set_point_if_failure_is_detected': None,
+        'zero_charge_discharge_limits_if_failure_is_detected': 0,
+    })
+    # force None for ac setpoint (update_config reads key)
+    mgr.ac_power_setpoint = None
+    mgr.zero_charge_discharge = False
+    mgr.switch_off_multis = False
+    attempted = mgr.enter(reason='test')
+    assert attempted is False
+    vo.set_ccgx_value.assert_not_called()
+    vo.set_multis_switch_mode.assert_not_called()
+    assert mgr.active is True
+
+
+def test_clear_resets_flag_without_hardware_restore():
+    mgr, vo = _manager()
+    mgr.enter(reason='x')
+    vo.reset_mock()
+    mgr.clear(reason='recovered')
+    assert mgr.active is False
+    assert mgr.last_reason == ''
+    vo.set_ccgx_value.assert_not_called()
+    vo.set_multis_switch_mode.assert_not_called()
+
+
+def test_clear_when_already_inactive_is_noop():
+    mgr, vo = _manager()
+    mgr.clear()
+    assert mgr.active is False
