@@ -37,3 +37,8 @@ SAFE_STATE_MULTIS_OFF = 4
 
 # Default MultiPlus Mode when recovering / not in failure (On)
 DEFAULT_MULTIS_ON = 3
+
+# Must match controller ess_config ``controller_heartbeat_topic`` (and the
+# controller constants default). Used only as documentation / fallback hint;
+# runtime value comes from watchdog_config.json.
+DEFAULT_CONTROLLER_HEARTBEAT_TOPIC = 'essbatt/controller/heartbeat'

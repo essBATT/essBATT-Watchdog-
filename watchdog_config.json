@@ -9,10 +9,9 @@
     "watchdog_update_rate": 2.0,
     "keepalive_get_all_topics": 0,
 
-    "controller_heartbeat_topic": "none",
+    "controller_heartbeat_topic": "essbatt/controller/heartbeat",
     "essBATT_controller_timeout_detection_duration": 95,
     "victron_CCGX_timeout_detection_duration": 60,
-    "victron_CCGX_timout_detection_duration": 60,
 
     "send_keep_alive_if_essBATT_controller_is_down": 1,
     "switch_off_multis_if_failure_is_detected": 1,
