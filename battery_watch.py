@@ -8,7 +8,8 @@ Reads rules from ``watchdog_config.json`` → ``battery_watch``. Each rule is:
   "cell_voltage_too_high": { "threshold": 3.6, "level": "critical" }
 
 ``level`` is ``info`` | ``warning`` | ``critical`` and selects which
-notification channels fire (see Notifier). ``threshold: "none"`` disables
+notification channels fire (see Notifier). Level ``critical`` also drives
+safe-state entry in the composition root. ``threshold: "none"`` disables
 a rule.
 """
 
@@ -111,28 +112,45 @@ class BatteryWatch:
     def __init__(self, config, logger, notifier):
         self.logger = logger
         self.notifier = notifier
-        self._active_alerts = set()  # prevent spam while condition persists
+        # cfg_key -> level while condition is still breached (anti-spam)
+        self._active_alerts = {}
         self.update_config(config)
 
     def update_config(self, config):
         self.config = config
         self.rules = config.get('battery_watch', {}) or {}
 
+    def _status(self, newly_critical=None):
+        """Build the evaluate() return dict from current active alerts."""
+        critical_active = sorted(
+            k for k, level in self._active_alerts.items() if level == 'critical'
+        )
+        return {
+            'active': sorted(self._active_alerts.keys()),
+            'critical_active': critical_active,
+            'newly_critical': list(newly_critical or []),
+        }
+
     def evaluate(self, local_values):
         """Check thresholds; notify on rising edge of each alert condition.
 
         Returns:
-            list of currently active alert keys
+            dict with:
+              active: list of currently breached rule keys
+              critical_active: subset with level == critical (safe-state hold)
+              newly_critical: keys that became critical this tick (rising edge)
         """
         if not local_values.get('all_CCGX_values_available', False):
-            return list(self._active_alerts)
+            # Keep previous state; no new rising edges while data is incomplete.
+            return self._status(newly_critical=[])
 
         # Convenience: abs current for over-current check
         current = local_values.get('battery_current')
         if current is not None:
             local_values['battery_current_abs'] = abs(current)
 
-        active_now = set()
+        active_now = {}
+        newly_critical = []
 
         for cfg_key, value_key, op, title, default_level in _CHECK_SPECS:
             threshold, level = _parse_rule(
@@ -146,7 +164,7 @@ class BatteryWatch:
             breached = (value > threshold) if op == 'gt' else (value < threshold)
             if not breached:
                 continue
-            active_now.add(cfg_key)
+            active_now[cfg_key] = level
             if cfg_key not in self._active_alerts:
                 body = (
                     title + ': value=' + str(value)
@@ -160,10 +178,12 @@ class BatteryWatch:
                 )
                 log_fn(body)
                 self.notifier.notify_alert(title, body, severity=level)
+                if level == 'critical':
+                    newly_critical.append(cfg_key)
 
-        recovered = self._active_alerts - active_now
-        for key in recovered:
+        recovered = set(self._active_alerts) - set(active_now)
+        for key in sorted(recovered):
             self.logger.info('Battery alert cleared: ' + key)
 
         self._active_alerts = active_now
-        return list(self._active_alerts)
+        return self._status(newly_critical=newly_critical)

@@ -3,6 +3,11 @@
 
 """Bring the Victron ESS into a configured safe state on detected failures.
 
+Triggers (composition root decides via ``resolve_safe_state_action``):
+  - controller / CCGX timeouts (FailureMonitor)
+  - battery_watch rules with level ``critical``
+  - unhandled exceptions in the monitor cycle
+
 Actions (driven by watchdog_config.json):
   - optionally set AcPowerSetPoint
   - optionally switch Multis off (vebus Mode = 4)
@@ -12,6 +17,58 @@ Idempotent: repeated calls while already active only re-assert setpoints.
 """
 
 import constants
+
+
+def resolve_safe_state_action(failure_status, battery_status, safe_state_active):
+    """Decide enter / reassert / clear from failure + battery critical state.
+
+    Args:
+        failure_status: dict from FailureMonitor.evaluate()
+        battery_status: dict from BatteryWatch.evaluate()
+        safe_state_active: current SafeStateManager.active flag
+
+    Returns:
+        dict with:
+          action: 'enter' | 'reassert' | 'clear' | 'none'
+          reason: str (for enter; else '')
+          notify_failure: bool (True if a new controller/CCGX failure should
+              trigger the generic failure notification)
+    """
+    newly_failed = list(failure_status.get('newly_failed') or [])
+    newly_critical = list(battery_status.get('newly_critical') or [])
+    critical_active = list(battery_status.get('critical_active') or [])
+
+    reason_parts = list(newly_failed)
+    if newly_critical:
+        reason_parts.append(
+            'battery_critical (' + ', '.join(newly_critical) + ')'
+        )
+
+    hold = bool(failure_status.get('any_failure')) or bool(critical_active)
+
+    if reason_parts:
+        return {
+            'action': 'enter',
+            'reason': '; '.join(reason_parts),
+            'notify_failure': bool(newly_failed),
+        }
+    if hold and safe_state_active:
+        return {
+            'action': 'reassert',
+            'reason': '',
+            'notify_failure': False,
+        }
+    if not hold and safe_state_active:
+        return {
+            'action': 'clear',
+            'reason': '',
+            'notify_failure': False,
+        }
+    return {
+        'action': 'none',
+        'reason': '',
+        'notify_failure': False,
+    }
 
 
 class SafeStateManager:

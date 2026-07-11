@@ -47,7 +47,7 @@ from data_mapper import CcgxDataMapper
 from victron_output import VictronOutput
 from mqtt_bridge import MqttBridge
 from failure_monitor import FailureMonitor
-from safe_state import SafeStateManager
+from safe_state import SafeStateManager, resolve_safe_state_action
 from notifier import Notifier
 from battery_watch import BatteryWatch
 
@@ -198,8 +198,14 @@ class essBATT_watchdog:
     # ==================================================================
 
     def watchdog_cycle_update(self):
-        """One monitor tick: map inputs → failure checks → safe state / notify.
+        """One monitor tick: map inputs → failure/battery checks → safe state.
 
+        Safe state is entered/held for:
+          * controller or CCGX timeouts
+          * battery_watch rules with level ``critical``
+          * unhandled exceptions in this cycle
+
+        info/warning battery breaches only notify (no safe state).
         Skips work while MQTT is down. Domain exceptions are logged so the
         timer thread keeps living.
         """
@@ -211,32 +217,37 @@ class essBATT_watchdog:
             self.data_mapper.read_values_to_local_dict(self.CCGX_data, local_values)
 
             # --- liveness of controller + CCGX ---
-            status = self.failure_monitor.evaluate()
+            failure_status = self.failure_monitor.evaluate()
 
-            if status['newly_failed']:
-                reason = '; '.join(status['newly_failed'])
-                self.safe_state.enter(reason=reason)
-                self.notifier.notify_alert(
-                    'essBATT Watchdog failure',
-                    reason,
-                    severity='critical',
-                )
-            elif status['any_failure'] and self.safe_state.active:
-                # Re-assert safe state periodically while failure persists
+            # --- battery thresholds (notify on rising edge; report critical) ---
+            battery_status = self.battery_watch.evaluate(local_values)
+
+            decision = resolve_safe_state_action(
+                failure_status,
+                battery_status,
+                self.safe_state.active,
+            )
+
+            if decision['action'] == 'enter':
+                self.safe_state.enter(reason=decision['reason'])
+                if decision['notify_failure']:
+                    self.notifier.notify_alert(
+                        'essBATT Watchdog failure',
+                        decision['reason'],
+                        severity='critical',
+                    )
+            elif decision['action'] == 'reassert':
+                # Re-apply setpoints while timeout and/or critical battery persist
                 self.safe_state.enter(reason=self.safe_state.last_reason)
-            elif not status['any_failure'] and self.safe_state.active:
-                self.safe_state.clear(reason='all monitored sources healthy again')
+            elif decision['action'] == 'clear':
+                self.safe_state.clear(
+                    reason='timeouts and critical battery conditions cleared'
+                )
                 self.notifier.notify_recovery(
                     'essBATT Watchdog recovery',
-                    'Controller and CCGX timeouts cleared. Safe-state flag cleared '
-                    '(hardware not auto-restored).',
+                    'Controller/CCGX timeouts and critical battery limits cleared. '
+                    'Safe-state flag cleared (hardware not auto-restored).',
                 )
-
-            # --- optional Cerbo keepalive if controller is down ---
-            # (periodic keepalive timer handles the steady case; see below)
-
-            # --- battery threshold notifications ---
-            self.battery_watch.evaluate(local_values)
 
         except Exception:
             self.logger.exception(

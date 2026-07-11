@@ -50,13 +50,15 @@ def test_rising_edge_notifies_with_configured_level():
         MagicMock(),
         notifier,
     )
-    bw.evaluate(_full_local(battery_max_cell_voltage=3.7))
+    status = bw.evaluate(_full_local(battery_max_cell_voltage=3.7))
     notifier.notify_alert.assert_called_once()
     args, kwargs = notifier.notify_alert.call_args
     assert args[0] == 'Max cell voltage high'
     assert kwargs.get('severity') == 'critical' or (
         len(args) > 2 and args[2] == 'critical'
     )
+    assert status['critical_active'] == ['cell_voltage_too_high']
+    assert status['newly_critical'] == ['cell_voltage_too_high']
 
 
 def test_no_repeat_while_still_breached():
@@ -69,9 +71,13 @@ def test_no_repeat_while_still_breached():
         notifier,
     )
     local = _full_local(battery_max_cell_voltage=3.7)
-    bw.evaluate(local)
-    bw.evaluate(local)
+    first = bw.evaluate(local)
+    second = bw.evaluate(local)
     assert notifier.notify_alert.call_count == 1
+    assert first['newly_critical'] == []
+    assert second['newly_critical'] == []
+    assert second['critical_active'] == []
+    assert 'cell_voltage_too_high' in second['active']
 
 
 def test_clears_and_can_retrigger():
@@ -133,3 +139,25 @@ def test_current_uses_absolute_value():
     )
     bw.evaluate(_full_local(battery_current=-55.0))
     assert notifier.notify_alert.called
+
+
+def test_critical_hold_then_clear():
+    notifier = MagicMock()
+    bw = BatteryWatch(
+        _config({
+            'pack_voltage_too_low': {'threshold': 46, 'level': 'critical'},
+        }),
+        MagicMock(),
+        notifier,
+    )
+    s1 = bw.evaluate(_full_local(battery_voltage=45.0))
+    assert s1['newly_critical'] == ['pack_voltage_too_low']
+    assert s1['critical_active'] == ['pack_voltage_too_low']
+
+    s2 = bw.evaluate(_full_local(battery_voltage=45.0))
+    assert s2['newly_critical'] == []
+    assert s2['critical_active'] == ['pack_voltage_too_low']
+
+    s3 = bw.evaluate(_full_local(battery_voltage=50.0))
+    assert s3['critical_active'] == []
+    assert s3['active'] == []
