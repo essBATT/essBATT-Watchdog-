@@ -4,6 +4,17 @@
             "enabled": 1,
             "bot_token": "123456789:AA...your_token_from_BotFather...",
             "chat_id": "512345678"
+        },
+        "mail": {
+            "enabled": 1,
+            "to_address": "you@example.com",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "smtp_user": "YOUR_SMTP_USER",
+            "smtp_password": "YOUR_SMTP_PASSWORD",
+            "from_address": "essbatt-watchdog@example.com",
+            "use_tls": 1,
+            "use_ssl": 0
         }
     }
 }

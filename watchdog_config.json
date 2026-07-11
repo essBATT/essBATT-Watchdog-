@@ -22,11 +22,15 @@
     "notifications": {
         "mail": {
             "enabled": 0,
+            "to_address": "your.mailaddress@abc.com",
             "smtp_host": "smtp.example.com",
             "smtp_port": 587,
             "smtp_user": "",
             "smtp_password": "",
-            "from_address": "essbatt-watchdog@example.com"
+            "from_address": "essbatt-watchdog@example.com",
+            "use_tls": 1,
+            "use_ssl": 0,
+            "timeout_s": 15
         },
         "telegram": {
             "enabled": 0,
