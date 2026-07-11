@@ -36,6 +36,20 @@
             "bot_token": "YOUR_BOT_TOKEN",
             "chat_id": "YOUR_CHAT_ID",
             "timeout_s": 10
+        },
+        "pushover": {
+            "enabled": 0,
+            "api_token": "YOUR_PUSHOVER_APP_TOKEN",
+            "user_key": "YOUR_PUSHOVER_USER_KEY",
+            "min_severity": "critical",
+            "priority_critical": 2,
+            "priority_error": 1,
+            "priority_warning": 0,
+            "priority_info": 0,
+            "retry_s": 60,
+            "expire_s": 900,
+            "sound": "siren",
+            "timeout_s": 15
         }
     },
 

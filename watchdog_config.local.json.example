@@ -15,6 +15,16 @@
             "from_address": "essbatt-watchdog@example.com",
             "use_tls": 1,
             "use_ssl": 0
+        },
+        "pushover": {
+            "enabled": 1,
+            "api_token": "YOUR_PUSHOVER_APP_TOKEN",
+            "user_key": "YOUR_PUSHOVER_USER_KEY",
+            "min_severity": "critical",
+            "priority_critical": 2,
+            "retry_s": 60,
+            "expire_s": 900,
+            "sound": "siren"
         }
     }
 }

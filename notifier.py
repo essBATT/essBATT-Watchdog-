@@ -1,10 +1,11 @@
 # This is free and unencumbered software released into the public domain.
 # (full license text omitted for brevity - same as original)
 
-"""User notification channels for essBATT Watchdog (Telegram, Mail, …).
+"""User notification channels for essBATT Watchdog (Telegram, Mail, Pushover).
 
-Telegram uses the Bot API ``sendMessage`` endpoint over HTTPS (stdlib only).
-Mail uses SMTP via ``smtplib`` + ``email.message`` (stdlib only).
+Telegram: Bot API ``sendMessage`` (HTTPS, stdlib).
+Mail: SMTP via ``smtplib`` + ``email.message`` (stdlib).
+Pushover: ``https://api.pushover.net/1/messages.json`` (HTTPS form POST, stdlib).
 
 Credentials may come from config (prefer ``watchdog_config.local.json``) or
 environment variables (env wins when set):
@@ -17,6 +18,8 @@ environment variables (env wins when set):
   ESSBATT_MAIL_SMTP_PORT
   ESSBATT_MAIL_SMTP_USER
   ESSBATT_MAIL_SMTP_PASSWORD
+  ESSBATT_PUSHOVER_TOKEN
+  ESSBATT_PUSHOVER_USER
 """
 
 import json
@@ -24,11 +27,13 @@ import os
 import smtplib
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from email.message import EmailMessage
 
 
 TELEGRAM_API_BASE = 'https://api.telegram.org'
+PUSHOVER_API_URL = 'https://api.pushover.net/1/messages.json'
 
 # Values treated as "not configured" for mail
 _MAIL_PLACEHOLDERS = frozenset({
@@ -40,6 +45,12 @@ _MAIL_PLACEHOLDERS = frozenset({
     'YOUR_SMTP_PASSWORD',
 })
 
+_PUSHOVER_PLACEHOLDERS = frozenset({
+    '',
+    'YOUR_PUSHOVER_APP_TOKEN',
+    'YOUR_PUSHOVER_USER_KEY',
+})
+
 # Visual severity markers (especially useful in Telegram notification previews)
 _SEVERITY_EMOJI = {
     'critical': '🚨',
@@ -48,12 +59,25 @@ _SEVERITY_EMOJI = {
     'info': 'ℹ️',
 }
 
+_SEVERITY_RANK = {
+    'info': 0,
+    'warning': 1,
+    'error': 2,
+    'critical': 3,
+}
+
 
 def format_severity_label(severity):
     """Return e.g. '🚨 CRITICAL' for notification titles/bodies."""
     key = str(severity or 'error').strip().lower()
     emoji = _SEVERITY_EMOJI.get(key, '▪️')
     return emoji + ' ' + key.upper()
+
+
+def severity_rank(severity):
+    """Numeric rank for min-severity filtering (unknown → error)."""
+    key = str(severity or 'error').strip().lower()
+    return _SEVERITY_RANK.get(key, _SEVERITY_RANK['error'])
 
 
 class Notifier:
@@ -78,6 +102,7 @@ class Notifier:
         notifications = config.get('notifications', {})
         self.telegram_cfg = dict(notifications.get('telegram', {}) or {})
         self.mail_cfg = dict(notifications.get('mail', {}) or {})
+        self.pushover_cfg = dict(notifications.get('pushover', {}) or {})
 
         # --- Telegram env overrides ---
         env_token = os.environ.get('ESSBATT_TELEGRAM_BOT_TOKEN', '').strip()
@@ -109,8 +134,17 @@ class Notifier:
                 else:
                     self.mail_cfg[cfg_key] = val
 
+        # --- Pushover env overrides ---
+        env_po_token = os.environ.get('ESSBATT_PUSHOVER_TOKEN', '').strip()
+        env_po_user = os.environ.get('ESSBATT_PUSHOVER_USER', '').strip()
+        if env_po_token:
+            self.pushover_cfg['api_token'] = env_po_token
+        if env_po_user:
+            self.pushover_cfg['user_key'] = env_po_user
+
         self.telegram_enabled = self.telegram_cfg.get('enabled', 0) == 1
         self.mail_enabled = self.mail_cfg.get('enabled', 0) == 1
+        self.pushover_enabled = self.pushover_cfg.get('enabled', 0) == 1
 
     def notify_alert(self, title, body, severity='error'):
         """Send an alert on all enabled channels.
@@ -128,6 +162,8 @@ class Notifier:
             self._send_mail(title, body, severity)
         if self.telegram_enabled:
             self._send_telegram(title, body, severity)
+        if self.pushover_enabled:
+            self._send_pushover(title, body, severity)
 
     def notify_recovery(self, title, body):
         """Notify that a previously failing condition recovered."""
@@ -340,4 +376,147 @@ class Notifier:
             return False
         except Exception:
             self.logger.exception('Unexpected error while sending Telegram message')
+            return False
+
+    # ------------------------------------------------------------------
+    # Pushover
+    # ------------------------------------------------------------------
+    def _pushover_credentials(self):
+        """Return (api_token, user_key) or (None, None) if incomplete."""
+        token = str(self.pushover_cfg.get('api_token') or '').strip()
+        user = str(self.pushover_cfg.get('user_key') or '').strip()
+        if not token or token in _PUSHOVER_PLACEHOLDERS:
+            return None, None
+        if not user or user in _PUSHOVER_PLACEHOLDERS:
+            return None, None
+        return token, user
+
+    def _pushover_meets_min_severity(self, severity):
+        min_sev = str(
+            self.pushover_cfg.get('min_severity', 'critical')
+        ).strip().lower()
+        return severity_rank(severity) >= severity_rank(min_sev)
+
+    def _pushover_priority_for(self, severity):
+        """Map severity to Pushover priority (-2…2)."""
+        sev = str(severity or 'error').strip().lower()
+        key = 'priority_' + sev
+        default = {
+            'critical': 2,
+            'error': 1,
+            'warning': 0,
+            'info': 0,
+        }.get(sev, 0)
+        try:
+            return int(self.pushover_cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _send_pushover(self, title, body, severity):
+        """Send a Pushover notification. Returns True on success.
+
+        Critical alerts default to emergency priority (2) with retry/expire so
+        the app keeps alerting until the user acknowledges.
+        """
+        if not self._pushover_meets_min_severity(severity):
+            self.logger.debug(
+                'Pushover skipped (severity '
+                + str(severity)
+                + ' below min_severity '
+                + str(self.pushover_cfg.get('min_severity', 'critical'))
+                + ').'
+            )
+            return False
+
+        token, user = self._pushover_credentials()
+        if token is None:
+            self.logger.error(
+                'Pushover enabled but api_token or user_key is missing/placeholder. '
+                'Set notifications.pushover in watchdog_config.local.json or env '
+                'ESSBATT_PUSHOVER_TOKEN / ESSBATT_PUSHOVER_USER.'
+            )
+            return False
+
+        label = format_severity_label(severity)
+        po_title = label + ' ' + str(title)
+        message = str(body)
+        if len(message) > 1000:
+            message = message[:997] + '...'
+
+        priority = self._pushover_priority_for(severity)
+        form = {
+            'token': token,
+            'user': user,
+            'title': po_title[:250],
+            'message': message if message else po_title,
+            'priority': str(priority),
+        }
+
+        sound = str(self.pushover_cfg.get('sound') or '').strip()
+        if sound and sound != 'none':
+            form['sound'] = sound
+
+        # Emergency priority requires retry (>=30s) and expire (<=10800s)
+        if priority == 2:
+            try:
+                retry_s = int(self.pushover_cfg.get('retry_s', 60))
+            except (TypeError, ValueError):
+                retry_s = 60
+            try:
+                expire_s = int(self.pushover_cfg.get('expire_s', 900))
+            except (TypeError, ValueError):
+                expire_s = 900
+            retry_s = max(30, retry_s)
+            expire_s = max(retry_s, min(10800, expire_s))
+            form['retry'] = str(retry_s)
+            form['expire'] = str(expire_s)
+
+        data = urllib.parse.urlencode(form).encode('utf-8')
+        request = urllib.request.Request(
+            PUSHOVER_API_URL,
+            data=data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            method='POST',
+        )
+        timeout_s = float(self.pushover_cfg.get('timeout_s', 15))
+
+        try:
+            with self._urlopen(request, timeout=timeout_s) as response:
+                raw = response.read()
+                try:
+                    result = json.loads(raw.decode('utf-8'))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self.logger.error(
+                        'Pushover API returned non-JSON response: ' + str(raw[:200])
+                    )
+                    return False
+                if result.get('status') != 1:
+                    # Never log tokens; errors list is enough
+                    self.logger.error(
+                        'Pushover send failed: ' + str(result.get('errors', result))
+                    )
+                    return False
+                self.logger.info(
+                    'Pushover alert sent (priority='
+                    + str(priority)
+                    + ', severity='
+                    + str(severity)
+                    + ').'
+                )
+                return True
+        except urllib.error.HTTPError as e:
+            detail = ''
+            try:
+                detail = e.read().decode('utf-8', errors='replace')[:300]
+            except Exception:
+                pass
+            self.logger.error(
+                'Pushover HTTP error ' + str(e.code) + ': ' + detail
+            )
+            return False
+        except urllib.error.URLError as e:
+            self.logger.error('Pushover network error: ' + str(e.reason))
+            return False
+        except Exception:
+            self.logger.exception('Unexpected error while sending Pushover message')
             return False

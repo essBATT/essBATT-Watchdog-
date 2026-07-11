@@ -1,6 +1,7 @@
-"""Tests for Notifier (Telegram + Mail delivery)."""
+"""Tests for Notifier (Telegram + Mail + Pushover delivery)."""
 
 import json
+import urllib.parse
 from email.message import EmailMessage
 from unittest.mock import MagicMock
 
@@ -61,7 +62,7 @@ class _FakeSMTP:
         pass
 
 
-def _base_config(telegram=None, mail=None):
+def _base_config(telegram=None, mail=None, pushover=None):
     return {
         'notifications': {
             'mail': mail if mail is not None else {'enabled': 0},
@@ -71,8 +72,28 @@ def _base_config(telegram=None, mail=None):
                 'chat_id': '999001',
                 'timeout_s': 5,
             },
+            'pushover': pushover if pushover is not None else {'enabled': 0},
         },
     }
+
+
+def _pushover_cfg(**overrides):
+    cfg = {
+        'enabled': 1,
+        'api_token': 'app-token',
+        'user_key': 'user-key',
+        'min_severity': 'critical',
+        'priority_critical': 2,
+        'priority_error': 1,
+        'priority_warning': 0,
+        'priority_info': 0,
+        'retry_s': 60,
+        'expire_s': 900,
+        'sound': 'siren',
+        'timeout_s': 5,
+    }
+    cfg.update(overrides)
+    return cfg
 
 
 def _mail_cfg(**overrides):
@@ -329,3 +350,137 @@ def test_mail_ssl_port_skips_starttls():
     )
     assert n._send_mail('t', 'b', 'info') is True
     assert _FakeSMTP.instances[0].started_tls is False
+
+
+# ---------------------------------------------------------------------------
+# Pushover
+# ---------------------------------------------------------------------------
+
+def test_pushover_disabled_does_not_call_api():
+    urlopen = MagicMock()
+    n = Notifier(
+        _base_config(telegram={'enabled': 0}, pushover={'enabled': 0}),
+        MagicMock(),
+        urlopen_fn=urlopen,
+    )
+    n.notify_alert('t', 'b', severity='critical')
+    urlopen.assert_not_called()
+
+
+def test_pushover_skips_below_min_severity():
+    urlopen = MagicMock()
+    n = Notifier(
+        _base_config(telegram={'enabled': 0}, pushover=_pushover_cfg()),
+        MagicMock(),
+        urlopen_fn=urlopen,
+    )
+    # warning < critical min
+    assert n._send_pushover('t', 'b', 'warning') is False
+    urlopen.assert_not_called()
+
+
+def test_pushover_critical_emergency_payload():
+    urlopen = MagicMock(
+        return_value=_FakeResponse(json.dumps({'status': 1, 'request': 'abc'}))
+    )
+    logger = MagicMock()
+    n = Notifier(
+        _base_config(telegram={'enabled': 0}, pushover=_pushover_cfg()),
+        logger,
+        urlopen_fn=urlopen,
+    )
+    assert n._send_pushover('Controller down', 'no heartbeat', 'critical') is True
+
+    urlopen.assert_called_once()
+    request = urlopen.call_args.args[0]
+    assert request.full_url == 'https://api.pushover.net/1/messages.json'
+    assert request.get_method() == 'POST'
+    form = urllib.parse.parse_qs(request.data.decode('utf-8'))
+    assert form['token'] == ['app-token']
+    assert form['user'] == ['user-key']
+    assert form['priority'] == ['2']
+    assert form['retry'] == ['60']
+    assert form['expire'] == ['900']
+    assert form['sound'] == ['siren']
+    assert form['title'][0].startswith('🚨 CRITICAL Controller down')
+    assert form['message'] == ['no heartbeat']
+    assert any('Pushover alert sent' in str(c.args[0]) for c in logger.info.call_args_list)
+
+
+def test_pushover_missing_credentials_logs_error():
+    urlopen = MagicMock()
+    logger = MagicMock()
+    n = Notifier(
+        _base_config(
+            telegram={'enabled': 0},
+            pushover=_pushover_cfg(api_token='YOUR_PUSHOVER_APP_TOKEN'),
+        ),
+        logger,
+        urlopen_fn=urlopen,
+    )
+    assert n._send_pushover('t', 'b', 'critical') is False
+    urlopen.assert_not_called()
+    assert logger.error.called
+
+
+def test_pushover_env_overrides(monkeypatch):
+    monkeypatch.setenv('ESSBATT_PUSHOVER_TOKEN', 'env-app')
+    monkeypatch.setenv('ESSBATT_PUSHOVER_USER', 'env-user')
+    urlopen = MagicMock(
+        return_value=_FakeResponse(json.dumps({'status': 1}))
+    )
+    n = Notifier(
+        _base_config(
+            telegram={'enabled': 0},
+            pushover=_pushover_cfg(api_token='cfg-app', user_key='cfg-user'),
+        ),
+        MagicMock(),
+        urlopen_fn=urlopen,
+    )
+    assert n._send_pushover('t', 'b', 'critical') is True
+    form = urllib.parse.parse_qs(urlopen.call_args.args[0].data.decode('utf-8'))
+    assert form['token'] == ['env-app']
+    assert form['user'] == ['env-user']
+
+
+def test_pushover_api_error_status():
+    urlopen = MagicMock(
+        return_value=_FakeResponse(
+            json.dumps({'status': 0, 'errors': ['application token is invalid']})
+        )
+    )
+    logger = MagicMock()
+    n = Notifier(
+        _base_config(telegram={'enabled': 0}, pushover=_pushover_cfg()),
+        logger,
+        urlopen_fn=urlopen,
+    )
+    assert n._send_pushover('t', 'b', 'critical') is False
+    assert any('invalid' in str(c.args[0]).lower() for c in logger.error.call_args_list)
+
+
+def test_notify_alert_critical_hits_pushover_and_telegram():
+    """Both channels fire for critical when enabled."""
+    calls = []
+
+    def urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        if 'pushover.net' in request.full_url:
+            return _FakeResponse(json.dumps({'status': 1}))
+        return _FakeResponse(json.dumps({'ok': True, 'result': {}}))
+
+    n = Notifier(
+        _base_config(
+            telegram={
+                'enabled': 1,
+                'bot_token': '123:ABC',
+                'chat_id': '999',
+            },
+            pushover=_pushover_cfg(),
+        ),
+        MagicMock(),
+        urlopen_fn=urlopen,
+    )
+    n.notify_alert('fail', 'reason', severity='critical')
+    assert any('api.telegram.org' in u for u in calls)
+    assert any('pushover.net' in u for u in calls)
