@@ -1,0 +1,9 @@
+{
+    "notifications": {
+        "telegram": {
+            "enabled": 1,
+            "bot_token": "123456789:AA...your_token_from_BotFather...",
+            "chat_id": "512345678"
+        }
+    }
+}

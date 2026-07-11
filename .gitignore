@@ -7,3 +7,6 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local secrets (copy from watchdog_config.local.json.example)
+watchdog_config.local.json

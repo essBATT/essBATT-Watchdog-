@@ -4,12 +4,32 @@
 """Configuration management for essBATT Watchdog.
 
 Loads ``watchdog_config.json`` and ``ess_setvalue_list.json``.
+
+Optional local secrets overlay (never commit this file):
+  ``watchdog_config.local.json`` is deep-merged on top of the base config.
+  Put Telegram tokens / chat_id only there (file is gitignored).
 """
 
+import copy
 import json
 from pathlib import Path
 
 import constants
+
+
+def deep_merge(base, overlay):
+    """Recursively merge overlay into a copy of base (dicts only)."""
+    result = copy.deepcopy(base)
+    for key, value in (overlay or {}).items():
+        if (
+            key in result
+            and isinstance(result[key], dict)
+            and isinstance(value, dict)
+        ):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
 
 
 class ConfigManager:
@@ -26,7 +46,7 @@ class ConfigManager:
             return Path(debug_path)
         return Path(prod_path)
 
-    def _read_json_file(self, debug_path, prod_path, description):
+    def _read_json_file(self, debug_path, prod_path, description, required=True):
         file_path = self._get_config_path(debug_path, prod_path)
         try:
             with open(file_path, encoding='utf-8') as f:
@@ -34,7 +54,10 @@ class ConfigManager:
             self.logger.debug(f'{description} loaded successfully from {file_path}')
             return data
         except FileNotFoundError:
-            self.logger.error(f'{description} not found at: {file_path}')
+            if required:
+                self.logger.error(f'{description} not found at: {file_path}')
+            else:
+                self.logger.debug(f'{description} not present (optional): {file_path}')
         except json.JSONDecodeError as e:
             self.logger.error(f'{description} contains invalid JSON: {e}')
         except OSError as e:
@@ -42,15 +65,29 @@ class ConfigManager:
         return None
 
     def load_config(self):
-        """Load watchdog_config.json and return the data."""
+        """Load base config, then optional local secrets overlay."""
         data = self._read_json_file(
             './smarthome_projects/essBATT-Watchdog-/watchdog_config.json',
             'watchdog_config.json',
             'watchdog_config.json',
+            required=True,
         )
         if data is None:
             self.config_data_loaded_correctly = False
             return {}
+
+        local = self._read_json_file(
+            './smarthome_projects/essBATT-Watchdog-/watchdog_config.local.json',
+            'watchdog_config.local.json',
+            'watchdog_config.local.json',
+            required=False,
+        )
+        if local:
+            data = deep_merge(data, local)
+            self.logger.info(
+                'Merged watchdog_config.local.json (local secrets/overrides).'
+            )
+
         self.config_data_loaded_correctly = True
         return data
 

@@ -30,8 +30,9 @@
         },
         "telegram": {
             "enabled": 0,
-            "bot_token": "",
-            "chat_id": ""
+            "bot_token": "YOUR_BOT_TOKEN",
+            "chat_id": "YOUR_CHAT_ID",
+            "timeout_s": 10
         }
     },
 
